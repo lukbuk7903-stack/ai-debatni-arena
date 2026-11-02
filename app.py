@@ -211,7 +211,60 @@ with st.sidebar:
 
 if app_mode == "❓ Nápověda a návody":
     st.title("📖 Nápověda a návody")
-    st.markdown("""... (Zde je text nápovědy) ...""") # Zkráceno pro přehlednost
+    st.markdown("""
+    Vítejte v AI Debatní Aréně! Zde najdete všechny informace k tomu, jak aplikaci ovládat a kde získat potřebné přístupy.
+    
+    ## 🚀 Obecný postup
+    1. **Získejte API klíč:** Vyberte si alespoň jednoho poskytovatele AI (Gemini, NVIDIA NIM nebo Mistral). Postupy najdete níže.
+    2. **Vložte klíč:** V postranním panelu vložte váš klíč do příslušného pole.
+    3. **Nastavte osobnosti:** Zadejte jména diskutujících, vyberte jejich poskytovatele a napište instrukce (nebo nahrajte PDF/MD soubor).
+    4. **Zadejte téma a spusťte:** Napište téma diskuze, zvolte počet kol a klikněte na **Spustit diskuzi**.
+    5. **Exportujte:** Po skončení debaty si můžete průběh a verdikt rozhodčího stáhnout jako Markdown nebo PDF.
+    
+    ---
+    ## 🔑 Kde získat API klíče a jaké jsou limity
+    """)
+
+    with st.expander("🔵 Google Gemini (Doporučeno pro vyhledávání)"):
+        st.markdown("""
+        **Jak získat klíč:**
+        1. Jděte na [Google AI Studio](https://aistudio.google.com/app/apikey).
+        2. Přihlaste se vaším Google účtem.
+        3. Klikněte na **Create API key** (Vytvořit API klíč).
+        4. Zkopírujte vygenerovaný klíč (začíná na `AIza...`).
+
+        **Limity (Free tier):**
+        *   Rychlost: ~15 požadavků za minutu (RPM) pro Flash-Lite modely.
+        *   Denní limit: 500 až 1 500 požadavků (podle modelu).
+        *   *Upozornění:* Pokud zapnete vyhledávání na internetu, spotřebováváte speciální kvótu, která se může vyčerpat rychleji a způsobit chybu 429.
+        """)
+
+    with st.expander("🟢 NVIDIA NIM (Doporučeno pro rychlost)"):
+        st.markdown("""
+        **Jak získat klíč:**
+        1. Jděte na [NVIDIA Build](https://build.nvidia.com/).
+        2. Zaregistrujte se.
+        3. Klikněte na své jméno vpravo nahoře -> **API Keys**.
+        4. Vygenerujte nový klíč (začíná na `nvapi-...`).
+        *(Ujistěte se, že váš klíč má oprávnění "Public API Endpoints", jinak se mohou objevit chyby 404.)*
+
+        **Limity (Free tier):**
+        *   Rychlost: ~40 požadavků za minutu (RPM).
+        *   Tokeny: Bez přísného limitu (velmi štědré).
+        """)
+
+    with st.expander("🟠 Mistral AI (Doporučeno pro dlouhé texty)"):
+        st.markdown("""
+        **Jak získat klíč:**
+        1. Jděte na [Mistral Console](https://console.mistral.ai/).
+        2. Zaregistrujte se (ověření telefonem, platební karta není nutná).
+        3. V levém menu přejděte na **API Keys**.
+        4. Klikněte na **Create new key** (Vytvořit nový klíč).
+
+        **Limity (Free tier):**
+        *   Rychlost: Záleží na modelu (obvykle 1 až 12 požadavků za sekundu).
+        *   Denní limit: Několik tisíc požadavků.
+        """)
 
 elif app_mode == "⚔️ Debatní Aréna":
     st.title("🗣️ AI Debatní Aréna")
