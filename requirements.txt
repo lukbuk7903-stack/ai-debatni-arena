@@ -1,0 +1,7 @@
+streamlit
+google-genai
+openai
+pypdf
+fpdf2
+markdown
+weasyprint
