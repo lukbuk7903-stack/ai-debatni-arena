@@ -91,6 +91,7 @@ def generate_pdf(text_content):
 
 # --- 2b. CLOUDFLARE R2 ---
 @st.cache_resource
+@st.cache_resource
 def get_r2_client():
     return boto3.client(
         service_name="s3",
@@ -98,7 +99,10 @@ def get_r2_client():
         aws_access_key_id=st.secrets["R2_ACCESS_KEY_ID"],
         aws_secret_access_key=st.secrets["R2_SECRET_ACCESS_KEY"],
         region_name="auto",
-        config=Config(signature_version="s3v4"),
+        config=Config(
+            signature_version="s3v4",
+            request_checksum_calculation="when_required"  # <- Tento řádek je klíčový
+        ),
     )
 
 def get_next_counter():
