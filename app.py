@@ -41,7 +41,8 @@ form_defaults = {
     "gemini_key": "", "nim_key": "", "mistral_key": "",
     "role_a_name": "", "role_a_prompt": "", "provider_a": "Gemini", "input_type_a": "Ručně",
     "role_b_name": "", "role_b_prompt": "", "provider_b": "Gemini", "input_type_b": "Ručně",
-    "provider_mod": "Gemini", "topic_input": "", "max_rounds": 4
+    "provider_mod": "Gemini", "topic_input": "", "max_rounds": 4,
+    "topic_input_type": "Ručně", "topic_document_text": "", "topic_summary": ""
 }
 for key, default in form_defaults.items():
     if key not in st.session_state:
@@ -91,7 +92,6 @@ def generate_pdf(text_content):
 
 # --- 2b. CLOUDFLARE R2 ---
 @st.cache_resource
-@st.cache_resource
 def get_r2_client():
     return boto3.client(
         service_name="s3",
@@ -101,7 +101,7 @@ def get_r2_client():
         region_name="auto",
         config=Config(
             signature_version="s3v4",
-            request_checksum_calculation="when_required"  # <- Tento řádek je klíčový
+            request_checksum_calculation="when_required"
         ),
     )
 
@@ -297,7 +297,7 @@ if app_mode == "❓ Nápověda a návody":
     1. **Získejte API klíč:** Vyberte si alespoň jednoho poskytovatele AI (Gemini, NVIDIA NIM nebo Mistral). Postupy najdete níže.
     2. **Vložte klíč:** V postranním panelu vložte váš klíč do příslušného pole.
     3. **Nastavte osobnosti:** Zadejte jména diskutujících, vyberte jejich poskytovatele a napište instrukce (nebo nahrajte PDF/MD soubor).
-    4. **Zadejte téma a spusťte:** Napište téma diskuze, zvolte počet kol a klikněte na **Spustit diskuzi**.
+    4. **Zadejte téma a spusťte:** Napište téma diskuze (nebo nahrajte dokumenty), zvolte počet kol a klikněte na **Spustit diskuzi**.
     5. **Exportujte:** Po skončení debaty si můžete průběh a verdikt rozhodčího stáhnout jako Markdown nebo PDF.
 
     ---
@@ -349,8 +349,24 @@ elif app_mode == "⚔️ Debatní Aréna":
     st.title("🗣️ AI Debatní Aréna")
     st.caption("Automatizovaná diskuze dvou AI osobností s dynamickým výběrem modelů.")
 
-    st.session_state.topic_input = st.text_input("Téma diskuze:", value=st.session_state.topic_input, placeholder="Zadej o čem mají diskutovat...")
-    topic = st.session_state.topic_input
+    # --- ZADÁNÍ TÉMATU ---
+    st.session_state.topic_input_type = st.radio("Způsob zadání tématu:", ["Ručně", "Nahrát soubor(y)"], index=0 if st.session_state.topic_input_type == "Ručně" else 1)
+    
+    if st.session_state.topic_input_type == "Ručně":
+        st.session_state.topic_input = st.text_input("Téma diskuze:", value=st.session_state.topic_input, placeholder="Zadej o čem mají diskutovat...")
+        topic = st.session_state.topic_input
+        st.session_state.topic_document_text = ""
+    else:
+        st.session_state.topic_input = st.text_input("Název diskuze (pro export a název souboru):", value=st.session_state.topic_input, placeholder="Např.: Analýza výroční zprávy...")
+        topic = st.session_state.topic_input
+        topic_files = st.file_uploader("Nahrajte podklady pro diskuzi (PDF, MD, TXT)", type=["pdf", "md", "txt"], accept_multiple_files=True)
+        
+        if topic_files:
+            full_text = ""
+            for f in topic_files:
+                full_text += f"--- Dokument: {f.name} ---\n" + extract_text_from_file(f) + "\n\n"
+            st.session_state.topic_document_text = full_text
+            st.success(f"Nahráno {len(topic_files)} dokumentů. AI z nich při spuštění vytvoří souhrn a citace.")
 
     if st.button("🚀 Spustit diskuzi", type="primary"):
         if not available_providers:
@@ -359,6 +375,9 @@ elif app_mode == "⚔️ Debatní Aréna":
         if not topic.strip() or not st.session_state.role_a_name.strip() or not st.session_state.role_a_prompt.strip() or not st.session_state.role_b_name.strip() or not st.session_state.role_b_prompt.strip():
             st.error("⚠️ Pro spuštění diskuze musíte vyplnit téma a nastavení pro obě osobnosti!")
             st.stop()
+        if st.session_state.topic_input_type == "Nahrát soubor(y)" and not st.session_state.topic_document_text:
+            st.error("⚠️ Musíte nahrát alespoň jeden dokument pro diskuzi!")
+            st.stop()
 
         st.session_state.full_history = []
         st.session_state.current_topic = topic
@@ -366,6 +385,7 @@ elif app_mode == "⚔️ Debatní Aréna":
         st.session_state.md_content = ""
         st.session_state.pdf_bytes = b""
         st.session_state.file_base_name = "debata"
+        st.session_state.topic_summary = ""
 
         try:
             gemini_client = genai.Client(api_key=st.session_state.gemini_key.strip(), http_options=types.HttpOptions(timeout=180000)) if "Gemini" in available_providers else None
@@ -394,6 +414,7 @@ elif app_mode == "⚔️ Debatní Aréna":
 
         def call_ai(system_prompt, user_prompt, provider):
             full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
+            
             if provider == "Gemini":
                 config = types.GenerateContentConfig()
                 last_error = None
@@ -401,6 +422,8 @@ elif app_mode == "⚔️ Debatní Aréna":
                     for attempt in range(2):
                         try:
                             response = gemini_client.models.generate_content(model=model_name, contents=full_prompt, config=config)
+                            if not response.text or not response.text.strip():
+                                raise Exception("Model Gemini vrátil prázdnou odpověď.")
                             return response.text, model_name
                         except Exception as e:
                             last_error = e
@@ -415,7 +438,10 @@ elif app_mode == "⚔️ Debatní Aréna":
                     for attempt in range(2):
                         try:
                             response = nim_client.chat.completions.create(model=model_name, messages=messages, temperature=0.7, extra_body={"chat_template_kwargs":{"enable_thinking":True}})
-                            return response.choices[0].message.content, model_name
+                            content = response.choices[0].message.content
+                            if not content or not content.strip():
+                                raise Exception("Model NVIDIA vrátil prázdnou odpověď.")
+                            return content, model_name
                         except Exception as e:
                             last_error = e
                             if attempt == 0: time.sleep(2)
@@ -429,31 +455,74 @@ elif app_mode == "⚔️ Debatní Aréna":
                     for attempt in range(2):
                         try:
                             response = mistral_client.chat.completions.create(model=model_name, messages=messages, temperature=0.7)
-                            return response.choices[0].message.content, model_name
+                            content = response.choices[0].message.content
+                            if not content or not content.strip():
+                                raise Exception("Model Mistral vrátil prázdnou odpověď.")
+                            return content, model_name
                         except Exception as e:
                             last_error = e
                             if attempt == 0: time.sleep(2)
                             else: break
                 raise Exception(f"Všechny Mistral modely selhaly: {last_error}")
 
+        # --- GENEROVÁNÍ SOUHRNU DOKUMENTŮ (Pokud byly nahrány) ---
+        if st.session_state.topic_input_type == "Nahrát soubor(y)" and st.session_state.topic_document_text:
+            with st.spinner("Analyzuji nahrané dokumenty a připravuji souhrn s citacemi..."):
+                summary_prompt = (
+                    "Jsi expert na analýzu dokumentů. Z následujících textů vytvoř strukturovaný souhrn. "
+                    "Uveď hlavní teze, klíčová fakta a přímé citace, které by měly být použity v diskuzi. "
+                    "Tento souhrn bude sloužit jako podklad pro debatující strany."
+                )
+                try:
+                    # Zkusíme nejprve Gemini, pak Mistral, pak NVIDIA
+                    priority = []
+                    if "Gemini" in available_providers: priority.append("Gemini")
+                    if "Mistral" in available_providers: priority.append("Mistral")
+                    if "NVIDIA NIM" in available_providers: priority.append("NVIDIA NIM")
+                    
+                    summary_text = None
+                    for p in priority:
+                        try:
+                            summary_text, _ = call_ai(summary_prompt, st.session_state.topic_document_text, p)
+                            break
+                        except Exception:
+                            continue
+                            
+                    if summary_text:
+                        st.session_state.topic_summary = summary_text
+                    else:
+                        st.session_state.topic_summary = "Nepodařilo se vygenerovat souhrn dokumentů."
+                except Exception as e:
+                    st.warning(f"Chyba při generování souhrnu: {e}")
+                    st.session_state.topic_summary = "Souhrn dokumentů se nepodařilo vygenerovat."
+            
+            st.markdown("#### 📄 Úvodní souhrn dokumentů")
+            st.info(st.session_state.topic_summary)
+            st.divider()
+
+        # Definice kontextu, který se předává diskutujícím
+        debate_context_intro = f"Téma diskuze: '{topic}'.\n\n"
+        if st.session_state.topic_summary:
+            debate_context_intro += f"Zde je souhrn z podkladových dokumentů, ze kterého vycházej:\n{st.session_state.topic_summary}\n\n"
+
         # 1. Úvodní slovo Osobnosti A
         with chat_container.chat_message("user", avatar="🔵"):
             st.markdown(f"**{st.session_state.role_a_name}:**")
             with st.spinner("Zahajuje diskuzi..."):
-                resp_a, mod_a = call_ai(st.session_state.role_a_prompt, f"Zahaj diskuzi na téma: '{topic}'. Vycházej ze svých znalostí a předlož svůj první argument.", st.session_state.provider_a)
+                resp_a, mod_a = call_ai(st.session_state.role_a_prompt, debate_context_intro + "Zahaj diskuzi a předlož svůj první argument.", st.session_state.provider_a)
             st.markdown(resp_a)
             st.caption(f"🤖 `{mod_a}`")
-
+        
         st.session_state.full_history.append((st.session_state.role_a_name, resp_a, mod_a))
 
         # 2. Smyčka debaty
         for r in range(st.session_state.max_rounds):
             progress_bar.progress((r + 1) / st.session_state.max_rounds)
             time.sleep(get_delay_for_provider(st.session_state.provider_b))
-
+            
             # Tah Osobnosti B
-            context_b = "Kontext diskuze:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history[-memory_limit:]]) + f"\nNyní jsi na řadě ty ({st.session_state.role_b_name}). Reaguj na argumenty oponenta."
-
+            context_b = debate_context_intro + "Kontext diskuze:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history[-memory_limit:]]) + f"\nNyní jsi na řadě ty ({st.session_state.role_b_name}). Reaguj na argumenty oponenta."
+            
             with chat_container.chat_message("assistant", avatar="🔴"):
                 st.markdown(f"**{st.session_state.role_b_name}:**")
                 with st.spinner("Reaguje..."):
@@ -465,8 +534,8 @@ elif app_mode == "⚔️ Debatní Aréna":
             # Tah Osobnosti A (pouze pokud to není poslední kolo)
             if r < st.session_state.max_rounds - 1:
                 time.sleep(get_delay_for_provider(st.session_state.provider_a))
-                context_a = "Kontext diskuze:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history[-memory_limit:]]) + f"\nNyní jsi na řadě ty ({st.session_state.role_a_name}). Reaguj na argumenty oponenta."
-
+                context_a = debate_context_intro + "Kontext diskuze:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history[-memory_limit:]]) + f"\nNyní jsi na řadě ty ({st.session_state.role_a_name}). Reaguj na argumenty oponenta."
+                
                 with chat_container.chat_message("user", avatar="🔵"):
                     st.markdown(f"**{st.session_state.role_a_name}:**")
                     with st.spinner("Reaguje..."):
@@ -478,46 +547,61 @@ elif app_mode == "⚔️ Debatní Aréna":
         progress_bar.progress(1.0)
         time.sleep(get_delay_for_provider(st.session_state.provider_mod))
 
-        # Vykreslení rozhodčího POUZE JEDNOU
+        # 3. Rozhodčí
+        summary_context = (
+            f"ZADÁNÍ TÉMATU: '{st.session_state.current_topic}'\n\n"
+            f"SOUHRN DOKUMENTŮ: {st.session_state.topic_summary}\n\n"
+            "PRŮBĚH DEBATY:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history])
+        )
+        judge_prompt = (
+            "Jsi přísný a nestranný rozhodčí. Zhodnoť průběh debaty. "
+            "NEJDŘÍVE SI PEČLIVĚ PŘEČTI 'ZADÁNÍ TÉMATU'. "
+            "Pokud zadání obsahuje konkrétní požadavek na formu rozhodnutí (např. 'vyber jednu variantu', 'rozhodni pro jednoho', nebo naopak 'navrhni kompromis'), "
+            "MUSÍŠ tento pokyn bezpodmínečně dodržet. "
+            "Vždy jasně vysvětli, proč jsi se takto rozhodl."
+        )
+        
+        with st.spinner("Rozhodčí vyhodnocuje argumenty..."):
+            try:
+                final_sum, mod_mod = call_ai(judge_prompt, summary_context, st.session_state.provider_mod)
+            except Exception as e:
+                final_sum = f"Rozhodčí se nemohl vyjádřit. Došlo k chybě: {e}"
+                mod_mod = "Chyba API"
+
+        st.session_state.final_summary = final_sum
+        st.session_state.model_mod_used = mod_mod
+        st.session_state.debate_active = True
+
+        # Zobrazení rozhodčího
         with chat_container.chat_message("assistant", avatar="⚖️"):
             st.markdown("**Rozhodčí:**")
-            with st.spinner("Vyhodnocuje argumenty..."):
-                # 1. Do kontextu Explicitně přidáme znění tématu
-                summary_context = (
-                    f"ZADÁNÍ TÉMATU: '{st.session_state.current_topic}'\n\n"
-                    "PRŮBĚH DEBATY:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history])
-                )
-                
-                # 2. Upravíme prompt tak, aby se rozhodčí řídil instrukcemi ze zadání
-                judge_prompt = (
-                    "Jsi přísný a nestranný rozhodčí. Zhodnoť průběh debaty. "
-                    "NEJDŘÍVE SI PEČLIVĚ PŘEČTI 'ZADÁNÍ TÉMATU'. "
-                    "Pokud zadání obsahuje konkrétní požadavek na formu rozhodnutí (např. 'vyber jednu variantu', 'rozhodni pro jednoho', nebo naopak 'navrhni kompromis'), "
-                    "MUSÍŠ tento pokyn bezpodmínečně dodržet. "
-                    "Pokud zadání výslovně nevyžaduje kompromis, vyber jako vítěze jednu z diskutujících osobností. "
-                    "Vždy jasně vysvětli, proč jsi se takto rozhodl, a to jak na základě argumentů, tak na základě instrukcí v zadání."
-                )
-                
-                final_sum, mod_mod = call_ai(judge_prompt, summary_context, st.session_state.provider_mod)
-
-        # Příprava souborů + nahrání na R2
+            st.markdown(final_sum)
+            st.caption(f"🤖 `{mod_mod}`")
+            
+        # Příprava souborů a nahrání na Cloudflare R2
         with st.spinner("Připravuji soubory a nahrávám na Cloudflare R2..."):
             md_history = ""
             for sender, text, model in st.session_state.full_history:
                 md_history += f"### {sender}\n{text}\n\n<small>Použitý model: {model}</small>\n\n---\n\n"
-
-            st.session_state.md_content = (
-                f"# Diskuze: {st.session_state.current_topic}\n\n"
-                f"**Datum:** {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-                + md_history
-                + f"### Rozhodčí\n{final_sum}\n\n<small>Použitý model: {mod_mod}</small>"
-            )
+            
+            # Sestavení Markdownu (včetně úvodního souhrnu, pokud existuje)
+            md_content = f"# Diskuze: {st.session_state.current_topic}\n\n**Datum:** {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+            if st.session_state.topic_summary:
+                md_content += f"## Úvodní souhrn dokumentů\n\n{st.session_state.topic_summary}\n\n---\n\n"
+            
+            md_content += md_history + f"### Rozhodčí\n{final_sum}\n\n<small>Použitý model: {mod_mod}</small>"
+            
+            st.session_state.md_content = md_content
             st.session_state.pdf_bytes = generate_pdf(st.session_state.md_content)
 
-            # Pořadové číslo z R2 čítače
-            counter = get_next_counter()
+            # Získání pořadového čísla z R2
+            try:
+                counter = get_next_counter()
+            except Exception as e:
+                st.warning(f"⚠️ Nepodařilo se získat číslo z R2 (bude použito náhodné): {e}")
+                counter = f"{random.randint(10000, 99999):05d}"
 
-            # Název souboru přes AI (priorita Gemini -> Mistral -> NVIDIA)
+            # Generování názvu přes AI
             filename_base = generate_filename_from_topic(
                 st.session_state.current_topic,
                 call_ai,
@@ -526,29 +610,19 @@ elif app_mode == "⚔️ Debatní Aréna":
             full_base = f"{counter}_{filename_base}"
             st.session_state.file_base_name = full_base
 
-            # Nahrání na Cloudflare R2
+            # Nahrání na R2
             try:
                 s3 = get_r2_client()
                 bucket = st.secrets["R2_BUCKET_NAME"]
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=f"markdown/{full_base}.md",
-                    Body=st.session_state.md_content.encode("utf-8"),
-                    ContentType="text/markdown",
-                )
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=f"pdf/{full_base}.pdf",
-                    Body=st.session_state.pdf_bytes,
-                    ContentType="application/pdf",
-                )
+                s3.put_object(Bucket=bucket, Key=f"markdown/{full_base}.md", Body=st.session_state.md_content.encode("utf-8"), ContentType="text/markdown")
+                s3.put_object(Bucket=bucket, Key=f"pdf/{full_base}.pdf", Body=st.session_state.pdf_bytes, ContentType="application/pdf")
                 st.success(f"✅ Soubory nahrány na Cloudflare R2 jako `{full_base}.md` a `{full_base}.pdf`.")
             except Exception as e:
                 st.error(f"❌ Nahrání na R2 selhalo: {e}")
-
+        
         st.divider()
         render_downloads()
-
+        
         st.divider()
         if st.button("🔄 Nová debata", use_container_width=True):
             st.session_state.debate_active = False
@@ -557,13 +631,19 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.md_content = ""
             st.session_state.pdf_bytes = b""
             st.session_state.file_base_name = "debata"
+            st.session_state.topic_document_text = ""
+            st.session_state.topic_summary = ""
             st.rerun()
-
+            
         st.stop()
 
     if st.session_state.debate_active:
         st.divider()
         st.markdown(f"### 📌 Téma: *{st.session_state.current_topic}*")
+        
+        if st.session_state.topic_summary:
+            with st.expander("📄 Zobrazit úvodní souhrn dokumentů", expanded=False):
+                st.markdown(st.session_state.topic_summary)
 
         for i, (sender, text, model_used) in enumerate(st.session_state.full_history):
             avatar = "🔵" if i % 2 == 0 else "🔴"
@@ -580,7 +660,7 @@ elif app_mode == "⚔️ Debatní Aréna":
 
         st.divider()
         render_downloads()
-
+                
         st.divider()
         if st.button("🔄 Nová debata", use_container_width=True):
             st.session_state.debate_active = False
@@ -589,4 +669,6 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.md_content = ""
             st.session_state.pdf_bytes = b""
             st.session_state.file_base_name = "debata"
+            st.session_state.topic_document_text = ""
+            st.session_state.topic_summary = ""
             st.rerun()
