@@ -482,14 +482,23 @@ elif app_mode == "⚔️ Debatní Aréna":
         with chat_container.chat_message("assistant", avatar="⚖️"):
             st.markdown("**Rozhodčí:**")
             with st.spinner("Vyhodnocuje argumenty..."):
-                summary_context = "Průběh debaty:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history])
-                final_sum, mod_mod = call_ai("Jsi přísný rozhodčí. Zhodnoť argumenty. Urči vítěze a vysvětli proč.", summary_context, st.session_state.provider_mod)
-            st.markdown(final_sum)
-            st.caption(f"🤖 `{mod_mod}`")
-
-        st.session_state.final_summary = final_sum
-        st.session_state.model_mod_used = mod_mod
-        st.session_state.debate_active = True
+                # 1. Do kontextu Explicitně přidáme znění tématu
+                summary_context = (
+                    f"ZADÁNÍ TÉMATU: '{st.session_state.current_topic}'\n\n"
+                    "PRŮBĚH DEBATY:\n" + "\n".join([f"{s}: {t}" for s, t, m in st.session_state.full_history])
+                )
+                
+                # 2. Upravíme prompt tak, aby se rozhodčí řídil instrukcemi ze zadání
+                judge_prompt = (
+                    "Jsi přísný a nestranný rozhodčí. Zhodnoť průběh debaty. "
+                    "NEJDŘÍVE SI PEČLIVĚ PŘEČTI 'ZADÁNÍ TÉMATU'. "
+                    "Pokud zadání obsahuje konkrétní požadavek na formu rozhodnutí (např. 'vyber jednu variantu', 'rozhodni pro jednoho', nebo naopak 'navrhni kompromis'), "
+                    "MUSÍŠ tento pokyn bezpodmínečně dodržet. "
+                    "Pokud zadání výslovně nevyžaduje kompromis, vyber jako vítěze jednu z diskutujících osobností. "
+                    "Vždy jasně vysvětli, proč jsi se takto rozhodl, a to jak na základě argumentů, tak na základě instrukcí v zadání."
+                )
+                
+                final_sum, mod_mod = call_ai(judge_prompt, summary_context, st.session_state.provider_mod)
 
         # Příprava souborů + nahrání na R2
         with st.spinner("Připravuji soubory a nahrávám na Cloudflare R2..."):
