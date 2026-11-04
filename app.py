@@ -516,7 +516,7 @@ elif app_mode == "⚔️ Debatní Aréna":
         st.session_state.full_history.append((st.session_state.role_a_name, resp_a, mod_a))
 
         # 2. Smyčka debaty
-        for r in range(st.session_state.max_rounds):
+        for r in ):
             progress_bar.progress((r + 1) / st.session_state.max_rounds)
             time.sleep(get_delay_for_provider(st.session_state.provider_b))
             
