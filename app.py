@@ -7,6 +7,7 @@ from datetime import datetime
 import pypdf
 import os
 import urllib.request
+import urllib.parse
 import markdown
 from weasyprint import HTML, CSS
 from openai import OpenAI, APITimeoutError
@@ -15,6 +16,7 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 import re
+import json
 
 st.set_page_config(page_title="AI Debatní Aréna", layout="wide")
 
@@ -36,6 +38,16 @@ if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = b""
 if "file_base_name" not in st.session_state:
     st.session_state.file_base_name = "debata"
+
+# --- NOVÉ: Kritika ---
+if "critique_md" not in st.session_state:
+    st.session_state.critique_md = ""
+if "critique_pdf" not in st.session_state:
+    st.session_state.critique_pdf = b""
+if "critique_base" not in st.session_state:
+    st.session_state.critique_base = ""
+if "show_critique_ui" not in st.session_state:
+    st.session_state.show_critique_ui = False
 
 form_defaults = {
     "gemini_key": "", "nim_key": "", "mistral_key": "",
@@ -199,6 +211,342 @@ def render_downloads():
     """
     components.html(html_code, height=60)
 
+# --- 2c. NEZÁVISLÁ KRITIKA ---
+
+CRITIQUE_SYSTEM_PROMPT = (
+    "Jsi nezávislý recenzent a odborník na kritické hodnocení diskuzí. "
+    "Tvým úkolem je nestranně posoudit kvalitu diskuze a verdikt rozhodčího. "
+    "Buď konkrétní, kritický a konstruktivní. Odpovídej česky, strukturovaně v Markdownu."
+)
+
+def build_critique_prompt(md_content, topic):
+    return f"""Vyhodnoť mi tuto diskuzi. Její relevantnost a "recenzuj" verdikt rozhodčího.
+
+**Téma diskuze:** {topic}
+
+**Úkoly pro tebe:**
+1. **Relevantnost:** Zhodnoť, zda diskuze skutečně odpovídá na zadané téma.
+2. **Kvalita argumentace:** Posuď sílu argumentů obou stran – kde byly přesvědčivé, kde slabé?
+3. **Recenze verdiktu:** Byl verdikt rozhodčího oprávněný? Bylo odůvodnění přesvědčivé?
+4. **Silné a slabé stránky** obou diskutujících.
+5. **Návrh vyváženějšího verdiktu**, pokud s ním nesouhlasíš.
+6. **Doporučení** pro zlepšení příští diskuze.
+
+**Text diskuze:**
+
+{md_content}
+"""
+
+def build_short_prompt_for_perplexity(topic, presigned_url):
+    return (
+        f"Přečti obsah souboru na této URL a proveď nezávislou kritiku diskuze na téma '{topic}'. "
+        f"Zhodnoť relevanci diskuze, kvalitu argumentace obou stran a kriticky recenzuj verdikt rozhodčího. "
+        f"Navrhni vyváženější verdikt, pokud s ním nesouhlasíš. "
+        f"URL souboru (platnost 1 hodina): {presigned_url}"
+    )
+
+def get_presigned_url(key, expires_in=3600):
+    """Vygeneruje dočasnou veřejnou URL k soukromému souboru na R2."""
+    try:
+        s3 = get_r2_client()
+        bucket = st.secrets["R2_BUCKET_NAME"]
+        return s3.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket, 'Key': key},
+            ExpiresIn=expires_in
+        )
+    except Exception as e:
+        st.warning(f"⚠️ Nepodařilo se vygenerovat presigned URL: {e}")
+        return None
+
+def call_critique_api(system_prompt, user_prompt, provider, keys):
+    """Samostatné volání API pro kritiku – nezávislé na běhu debaty."""
+    if provider == "Gemini":
+        client = genai.Client(api_key=keys["gemini"], http_options=types.HttpOptions(timeout=180000))
+        models = get_available_gemini_models(client)
+        full = f"{system_prompt}\n\n---\n\n{user_prompt}"
+        last_err = None
+        for model in models:
+            try:
+                r = client.models.generate_content(model=model, contents=full, config=types.GenerateContentConfig())
+                if r.text and r.text.strip():
+                    return r.text, model
+            except Exception as e:
+                last_err = e
+        raise Exception(f"Kritika přes Gemini selhala: {last_err}")
+
+    elif provider == "NVIDIA NIM":
+        client = OpenAI(api_key=keys["nim"], base_url="https://integrate.api.nvidia.com/v1", timeout=180.0)
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        last_err = None
+        for model in NVIDIA_PREFERRED:
+            try:
+                r = client.chat.completions.create(model=model, messages=messages, temperature=0.7)
+                if r.choices[0].message.content:
+                    return r.choices[0].message.content, model
+            except Exception as e:
+                last_err = e
+        raise Exception(f"Kritika přes NVIDIA selhala: {last_err}")
+
+    elif provider == "Mistral":
+        client = OpenAI(api_key=keys["mistral"], base_url="https://api.mistral.ai/v1", timeout=180.0)
+        models = get_available_mistral_models(client)
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        last_err = None
+        for model in models:
+            try:
+                r = client.chat.completions.create(model=model, messages=messages, temperature=0.7)
+                if r.choices[0].message.content:
+                    return r.choices[0].message.content, model
+            except Exception as e:
+                last_err = e
+        raise Exception(f"Kritika přes Mistral selhala: {last_err}")
+
+    raise Exception(f"Neznámý poskytovatel: {provider}")
+
+def generate_critique_md(critique_text, model_used, topic):
+    ts = datetime.now().strftime('%d.%m.%Y %H:%M')
+    return f"""# Nezávislá kritika diskuze
+
+**Téma:** {topic}  
+**Datum kritiky:** {ts}  
+**Model kritika:** {model_used}
+
+---
+
+{critique_text}
+"""
+
+def save_critique_to_r2(base_name, md_content, pdf_bytes):
+    """Uloží kritiku na R2 do VERDICT/markdown/ a VERDICT/pdf/."""
+    try:
+        s3 = get_r2_client()
+        bucket = st.secrets["R2_BUCKET_NAME"]
+        s3.put_object(
+            Bucket=bucket, Key=f"VERDICT/markdown/{base_name}.md",
+            Body=md_content.encode("utf-8"), ContentType="text/markdown"
+        )
+        s3.put_object(
+            Bucket=bucket, Key=f"VERDICT/pdf/{base_name}.pdf",
+            Body=pdf_bytes, ContentType="application/pdf"
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def save_critique_result(critique_text, model_used):
+    """Vygeneruje PDF, uloží do session_state i na R2 a vrátí výsledek."""
+    base_name = f"{st.session_state.file_base_name}_kritika"
+    md_content = generate_critique_md(critique_text, model_used, st.session_state.current_topic)
+    pdf_bytes = generate_pdf(md_content)
+    st.session_state.critique_md = md_content
+    st.session_state.critique_pdf = pdf_bytes
+    st.session_state.critique_base = base_name
+    ok, err = save_critique_to_r2(base_name, md_content, pdf_bytes)
+    return ok, err, base_name
+
+def build_critique_html(md_content, base_name):
+    """Sestaví plnohodnotný HTML dokument pro nový panel prohlížeče."""
+    md_html = markdown.markdown(md_content, extensions=['tables', 'nl2br'])
+    md_b64 = base64.b64encode(md_content.encode('utf-8')).decode('utf-8')
+    pdf_b64 = base64.b64encode(st.session_state.critique_pdf).decode('utf-8') if st.session_state.critique_pdf else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Kritika – {base_name}</title>
+<style>
+    body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; max-width: 900px; margin: 30px auto; padding: 20px; line-height: 1.65; color: #2d3748; background: #fff; }}
+    h1 {{ color: #1a365d; border-bottom: 3px solid #3182ce; padding-bottom: 12px; }}
+    h2 {{ color: #2c5282; margin-top: 28px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; }}
+    h3 {{ color: #2b6cb0; }}
+    .controls {{ position: sticky; top: 0; background: #fff; padding: 15px 0; border-bottom: 1px solid #eee; margin-bottom: 25px; display: flex; gap: 10px; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }}
+    .btn {{ flex: 1; text-align: center; padding: 12px 16px; text-decoration: none; border-radius: 6px; border: none; cursor: pointer; font-size: 15px; font-family: inherit; font-weight: 600; transition: opacity 0.2s; }}
+    .btn-md {{ background: #f0f2f6; color: #31333f; border: 1px solid #d6d6d6; }}
+    .btn-pdf {{ background: #ff4b4b; color: #fff; }}
+    .btn-close {{ background: #4a5568; color: #fff; }}
+    .btn:hover {{ opacity: 0.85; }}
+    blockquote {{ border-left: 4px solid #cbd5e0; padding-left: 15px; color: #4a5568; background: #f7fafc; padding: 10px 15px; margin: 15px 0; }}
+    table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+    th, td {{ border: 1px solid #e2e8f0; padding: 8px 12px; text-align: left; }}
+    th {{ background: #edf2f7; }}
+    code {{ background: #f7fafc; padding: 2px 6px; border-radius: 3px; font-family: 'Consolas', monospace; font-size: 0.92em; }}
+    pre {{ background: #f7fafc; padding: 12px; border-radius: 6px; overflow-x: auto; }}
+</style>
+</head>
+<body>
+<div class="controls">
+    <a href="data:application/octet-stream;base64,{md_b64}" download="{base_name}.md" class="btn btn-md">📥 Stáhnout .md</a>
+    <a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" class="btn btn-pdf">📄 Stáhnout .pdf</a>
+    <button class="btn btn-close" onclick="window.close()">✖ Zavřít</button>
+</div>
+{md_html}
+</body>
+</html>"""
+
+def reset_critique_state():
+    st.session_state.critique_md = ""
+    st.session_state.critique_pdf = b""
+    st.session_state.critique_base = ""
+    st.session_state.show_critique_ui = False
+
+def render_critique_ui(available_providers_list):
+    """UI nezávislé kritiky – volá se za render_downloads()."""
+    if not st.session_state.md_content:
+        return
+
+    st.divider()
+    st.subheader("🔍 Nezávislá kritika diskuze")
+    st.caption("Nechte diskuzi a verdikt rozhodčího posoudit další nezávislou AI.")
+
+    # Tlačítko pro otevření UI
+    if not st.session_state.show_critique_ui and not st.session_state.critique_md:
+        if st.button("Spustit nezávislou kritiku", type="primary", use_container_width=True):
+            st.session_state.show_critique_ui = True
+            st.rerun()
+        return
+
+    # Výběr kritika
+    options = []
+    if "Gemini" in available_providers_list:
+        options.append("Gemini (API)")
+    if "Mistral" in available_providers_list:
+        options.append("Mistral (API)")
+    if "NVIDIA NIM" in available_providers_list:
+        options.append("NVIDIA NIM (API)")
+    options.append("Perplexity (externí – nový panel)")
+
+    if not available_providers_list:
+        st.warning("⚠️ Nemáte zadán žádný API klíč – můžete použít pouze externí Perplexity.")
+
+    selected = st.selectbox("Vyberte kritika:", options, key="critique_provider_select")
+    is_perplexity = "Perplexity" in selected
+
+    if not is_perplexity:
+        provider = selected.replace(" (API)", "")
+        if st.button(f"🚀 Generovat kritiku pomocí {provider}", type="primary", use_container_width=True):
+            keys = {
+                "gemini": st.session_state.gemini_key.strip(),
+                "nim": st.session_state.nim_key.strip(),
+                "mistral": st.session_state.mistral_key.strip(),
+            }
+            with st.spinner(f"{provider} generuje nezávislou kritiku..."):
+                try:
+                    critique_text, model_used = call_critique_api(
+                        CRITIQUE_SYSTEM_PROMPT,
+                        build_critique_prompt(st.session_state.md_content, st.session_state.current_topic),
+                        provider,
+                        keys,
+                    )
+                    ok, err, base_name = save_critique_result(critique_text, model_used)
+                    if ok:
+                        st.success(f"✅ Kritika uložena na R2 do `VERDICT/markdown/{base_name}.md` a `VERDICT/pdf/{base_name}.pdf`.")
+                    else:
+                        st.warning(f"⚠️ Kritika vygenerována, ale uložení na R2 selhalo: {err}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Chyba při generování kritiky: {e}")
+
+    else:
+        # --- Perplexity flow přes presigned URL ---
+        if st.session_state.file_base_name == "debata":
+            st.error("⚠️ Soubor diskuze nebyl nahrán na R2 (během debaty došlo k chybě uploadu). Použijte prosím API možnost výše.")
+        else:
+            st.markdown("**Automatické otevření Perplexity**")
+            st.caption("Perplexity si sama stáhne `.md` soubor pomocí dočasného (presigned) odkazu z vašeho R2 bucketu. Bucket zůstává soukromý.")
+
+            presigned = get_presigned_url(f"markdown/{st.session_state.file_base_name}.md", expires_in=3600)
+
+            if presigned:
+                topic = st.session_state.current_topic
+                short_prompt = build_short_prompt_for_perplexity(topic, presigned)
+                encoded = urllib.parse.quote(short_prompt)
+                perplexity_url = f"https://www.perplexity.ai/search?q={encoded}"
+
+                st.markdown(
+                    f'<a href="{perplexity_url}" target="_blank" '
+                    f'style="display:block; text-align:center; padding:12px 24px; background:#20b8cd; '
+                    f'color:white; text-decoration:none; border-radius:6px; font-weight:600; font-size:15px;">'
+                    f'🔗 Otevřít Perplexity s promptem a URL</a>',
+                    unsafe_allow_html=True
+                )
+
+                with st.expander("📋 Nebo zkopírujte URL a prompt ručně"):
+                    st.code(f"URL souboru (platnost 1 hodina):\n{presigned}", language=None)
+                    st.code(f"Prompt:\n{short_prompt}", language=None)
+                    st.caption("Vložte URL a prompt přímo do Perplexity chatu, pokud automatické otevření selže.")
+            else:
+                st.error("⚠️ Nepodařilo se vygenerovat presigned URL. Zkontrolujte konfiguraci R2.")
+
+            st.divider()
+            st.markdown("**Vložení výsledku z Perplexity:**")
+            pasted = st.text_area(
+                "Zkopírujte sem výsledek kritiky z Perplexity:",
+                height=180,
+                key="critique_pasted_perplexity"
+            )
+            if st.button("💾 Uložit vloženou kritiku na R2", type="primary", use_container_width=True):
+                if pasted.strip():
+                    ok, err, base_name = save_critique_result(pasted, "Perplexity")
+                    if ok:
+                        st.success(f"✅ Uloženo jako `VERDICT/markdown/{base_name}.md` a `VERDICT/pdf/{base_name}.pdf`.")
+                    else:
+                        st.warning(f"⚠️ Uložení selhalo: {err}")
+                    st.rerun()
+                else:
+                    st.error("Nejprve vložte text kritiky.")
+
+    # Zobrazení hotové kritiky
+    if st.session_state.critique_md:
+        st.divider()
+        st.subheader("✅ Hotová kritika")
+        st.caption(f"Uloženo jako: `VERDICT/markdown/{st.session_state.critique_base}.md` a `VERDICT/pdf/{st.session_state.critique_base}.pdf`")
+
+        md_b64 = base64.b64encode(st.session_state.critique_md.encode('utf-8')).decode('utf-8')
+        pdf_b64 = base64.b64encode(st.session_state.critique_pdf).decode('utf-8')
+        base_name = st.session_state.critique_base
+
+        st.markdown(
+            f'<div style="display:flex; gap:10px; margin:10px 0;">'
+            f'<a href="data:application/octet-stream;base64,{md_b64}" download="{base_name}.md" '
+            f'style="flex:1; text-align:center; padding:10px; background:#f0f2f6; color:#31333f; text-decoration:none; border-radius:5px; border:1px solid #d6d6d6;">📥 Kritika (.md)</a>'
+            f'<a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" '
+            f'style="flex:1; text-align:center; padding:10px; background:#ff4b4b; color:white; text-decoration:none; border-radius:5px;">📄 Kritika (.pdf)</a>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        # Tlačítko pro otevření nového panelu prohlížeče s kritikou
+        # HTML je base64-encoded, takže se vyhneme problémům s </script> uvnitř stringu.
+        html_full = build_critique_html(st.session_state.critique_md, base_name)
+        html_b64 = base64.b64encode(html_full.encode('utf-8')).decode('utf-8')
+
+        components.html(
+            f'<button onclick="openCritique()" '
+            f'style="padding:12px 24px; background:#4b8bf4; color:white; border:none; border-radius:6px; '
+            f'cursor:pointer; font-size:16px; width:100%; font-weight:600; font-family:inherit;">'
+            f'🔗 Otevřít kritiku v novém panelu prohlížeče</button>'
+            f'<script>'
+            f'function openCritique() {{'
+            f'  try {{'
+            f'    const binary = atob("{html_b64}");'
+            f'    const bytes = new Uint8Array(binary.length);'
+            f'    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);'
+            f'    const html = new TextDecoder("utf-8").decode(bytes);'
+            f'    const blob = new Blob([html], {{type: "text/html;charset=utf-8"}});'
+            f'    const url = URL.createObjectURL(blob);'
+            f'    const w = window.open(url, "_blank");'
+            f'    if (!w) alert("⚠️ Panel byl zablokován. Povolte vyskakovací okna pro tuto stránku.");'
+            f'  }} catch (e) {{ alert("Chyba: " + e.message); }}'
+            f'}}'
+            f'</script>',
+            height=70
+        )
+
+        with st.expander("📄 Náhled kritiky", expanded=False):
+            st.markdown(st.session_state.critique_md)
+
 # Načtení klíčů ze Secrets (pokud jsou nastaveny)
 try: secret_gemini = st.secrets["GEMINI_API_KEY"]
 except: secret_gemini = ""
@@ -269,6 +617,7 @@ if app_mode == "❓ Nápověda a návody":
     3. **Nastavte osobnosti:** Zadejte jména diskutujících, vyberte jejich poskytovatele a napište instrukce (nebo nahrajte PDF/MD soubor).
     4. **Zadejte téma a spusťte:** Napište téma diskuze (nebo nahrajte dokumenty), zvolte počet kol a klikněte na **Spustit diskuzi**.
     5. **Exportujte:** Po skončení debaty si můžete průběh a verdikt rozhodčího stáhnout jako Markdown nebo PDF.
+    6. **Nezávislá kritika:** Po skončení debaty můžete nechat diskuzi posoudit další AI – buď přes API (Gemini/Mistral/NVIDIA), nebo přes externí Perplexity.
 
     ---
     ## 🔑 Kde získat API klíče a jaké jsou limity
@@ -315,6 +664,21 @@ if app_mode == "❓ Nápověda a návody":
         *   Denní limit: Několik tisíc požadavků.
         """)
 
+    with st.expander("🟣 Nezávislá kritika – jak to funguje"):
+        st.markdown("""
+        Po skončení debaty si můžete nechat diskuzi a verdikt rozhodčího posoudit další AI:
+
+        **API varianta (Gemini, Mistral, NVIDIA NIM):**
+        * Plně automatizované – server zavolá API, vygeneruje kritiku a uloží ji na R2 do `VERDICT/markdown/` a `VERDICT/pdf/`.
+
+        **Externí varianta (Perplexity):**
+        * Server vygeneruje tzv. **presigned URL** k vašemu `.md` souboru na R2 (platnost 1 hodina).
+        * Otevře se nový panel Perplexity s promptem a URL.
+        * Perplexity si soubor sama stáhne a provede kritiku.
+        * Výsledek zkopírujete zpět do aplikace a uloží se na R2 se stejnou strukturou.
+        * Váš R2 bucket zůstává **soukromý** – presigned URL je dočasná a nepředvídatelná.
+        """)
+
 elif app_mode == "⚔️ Debatní Aréna":
     st.title("🗣️ AI Debatní Aréna")
     st.caption("Automatizovaná diskuze dvou AI osobností s dynamickým výběrem modelů.")
@@ -334,7 +698,6 @@ elif app_mode == "⚔️ Debatní Aréna":
         
         if topic_files:
             file_names = "_".join([f.name for f in topic_files])
-            # Načteme dokumenty POUZE tehdy, pokud se změnil seznam nahraných souborů
             if st.session_state.uploaded_files_hash != file_names:
                 with st.spinner("Načítám a zpracovávám dokumenty..."):
                     full_text = ""
@@ -362,6 +725,7 @@ elif app_mode == "⚔️ Debatní Aréna":
         st.session_state.pdf_bytes = b""
         st.session_state.file_base_name = "debata"
         st.session_state.topic_summary = ""
+        reset_critique_state()
 
         try:
             gemini_client = genai.Client(api_key=st.session_state.gemini_key.strip(), http_options=types.HttpOptions(timeout=180000)) if "Gemini" in available_providers else None
@@ -574,6 +938,9 @@ elif app_mode == "⚔️ Debatní Aréna":
         st.divider()
         render_downloads()
         
+        # --- NOVÉ: Nezávislá kritika ---
+        render_critique_ui(available_providers)
+        
         st.divider()
         if st.button("🔄 Nová debata", use_container_width=True):
             st.session_state.debate_active = False
@@ -585,6 +952,7 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.topic_document_text = ""
             st.session_state.topic_summary = ""
             st.session_state.uploaded_files_hash = ""
+            reset_critique_state()
             st.rerun()
             
         st.stop()
@@ -611,6 +979,9 @@ elif app_mode == "⚔️ Debatní Aréna":
 
         st.divider()
         render_downloads()
+        
+        # --- NOVÉ: Nezávislá kritika ---
+        render_critique_ui(available_providers)
                 
         st.divider()
         if st.button("🔄 Nová debata", use_container_width=True):
@@ -623,4 +994,5 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.topic_document_text = ""
             st.session_state.topic_summary = ""
             st.session_state.uploaded_files_hash = ""
+            reset_critique_state()
             st.rerun()
