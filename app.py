@@ -6,7 +6,6 @@ import time, random
 from datetime import datetime
 import pypdf
 import os
-import urllib.request
 import urllib.parse
 import markdown
 from weasyprint import HTML, CSS
@@ -39,7 +38,7 @@ if "pdf_bytes" not in st.session_state:
 if "file_base_name" not in st.session_state:
     st.session_state.file_base_name = "debata"
 
-# --- NOVÉ: Kritika ---
+# --- STAV KRITIKY ---
 if "critique_md" not in st.session_state:
     st.session_state.critique_md = ""
 if "critique_pdf" not in st.session_state:
@@ -63,16 +62,14 @@ for key, default in form_defaults.items():
 
 # --- 2. POMOCNÉ FUNKCE ---
 def extract_text_from_file(uploaded_file):
-    if uploaded_file is None:
-        return ""
+    if uploaded_file is None: return ""
     file_extension = uploaded_file.name.split('.')[-1].lower()
     try:
         if file_extension == 'pdf':
             pdf_reader = pypdf.PdfReader(uploaded_file)
             text = ""
             for page in pdf_reader.pages:
-                if page.extract_text():
-                    text += page.extract_text() + "\n"
+                if page.extract_text(): text += page.extract_text() + "\n"
             return text.strip()
         else:
             return uploaded_file.read().decode("utf-8").strip()
@@ -112,10 +109,7 @@ def get_r2_client():
         aws_access_key_id=st.secrets["R2_ACCESS_KEY_ID"],
         aws_secret_access_key=st.secrets["R2_SECRET_ACCESS_KEY"],
         region_name="auto",
-        config=Config(
-            signature_version="s3v4",
-            request_checksum_calculation="when_required"
-        ),
+        config=Config(signature_version="s3v4", request_checksum_calculation="when_required"),
     )
 
 def get_next_counter():
@@ -125,41 +119,25 @@ def get_next_counter():
     try:
         obj = s3.get_object(Bucket=bucket, Key="counter.txt")
         current = int(obj["Body"].read().decode("utf-8").strip())
-    except ClientError as e:
-        if e.response.get('Error', {}).get('Code') not in ('NoSuchKey', '404', 'NoSuchBucket'):
-            st.warning(f"⚠️ Nepodařilo se načíst čítač z R2: {e}")
-    except Exception:
-        current = 0
+    except Exception: pass
     next_val = current + 1
     s3.put_object(Bucket=bucket, Key="counter.txt", Body=str(next_val).encode("utf-8"))
     return f"{next_val:05d}"
 
 def generate_filename_from_topic(topic, call_ai_func, available_providers):
-    priority = []
-    if "Gemini" in available_providers: priority.append("Gemini")
-    if "Mistral" in available_providers: priority.append("Mistral")
-    if "NVIDIA NIM" in available_providers: priority.append("NVIDIA NIM")
+    priority = [p for p in ["Gemini", "Mistral", "NVIDIA NIM"] if p in available_providers]
     if not priority: return "debata"
 
-    prompt = (
-        f"Na základě tématu diskuze vygeneruj velmi krátký název souboru "
-        f"(maximálně 7 slov). Použij pouze písmena bez diakritiky, číslice a podtržítka. "
-        f"Téma: '{topic}'"
-    )
-    system_prompt = "Jsi pomocník pro generování bezpečných názvů souborů. Odpovídej pouze názvem, nic jiného."
+    prompt = f"Na základě tématu vygeneruj krátký název souboru (max 7 slov, bez diakritiky, jen písmena/číslice/podtržítka). Téma: '{topic}'"
+    system_prompt = "Odpovídej pouze názvem souboru, nic jiného."
 
     for provider in priority:
         try:
             raw_name, _ = call_ai_func(system_prompt, prompt, provider)
-            clean = raw_name.strip().lower()
-            clean = re.sub(r"[^a-z0-9_]+", "_", clean)
+            clean = re.sub(r"[^a-z0-9_]+", "_", raw_name.strip().lower())
             clean = re.sub(r"_+", "_", clean).strip("_")
-            words = clean.split("_")
-            clean = "_".join(words[:7])
-            if clean: return clean
-        except Exception as e:
-            st.warning(f"⚠️ Generování názvu přes {provider} selhalo: {e}")
-            continue
+            if clean: return "_".join(clean.split("_")[:7])
+        except Exception: continue
     return "debata"
 
 GEMINI_PREFERRED = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
@@ -170,43 +148,33 @@ def get_available_gemini_models(client):
     try:
         models = client.models.list()
         available = [m.name.replace('models/', '') for m in models if 'generateContent' in getattr(m, 'supported_generation_methods', [])]
-        if not available: return GEMINI_PREFERRED
         verified = [m for m in GEMINI_PREFERRED if m in available]
-        return verified if verified else available
-    except Exception as e:
-        st.warning(f"⚠️ Nepodařilo se načíst seznam modelů Gemini: {e}")
-        return GEMINI_PREFERRED
-
-def get_available_nvidia_models(client):
-    return NVIDIA_PREFERRED
+        return verified if verified else (available if available else GEMINI_PREFERRED)
+    except Exception: return GEMINI_PREFERRED
 
 def get_available_mistral_models(client):
     try:
         all_models = client.models.list()
         available_ids = [m.id for m in all_models.data if m.id]
-        if not available_ids: return MISTRAL_PREFERRED
         verified = [m for m in MISTRAL_PREFERRED if m in available_ids]
-        return verified if verified else available_ids[:3]
-    except Exception as e:
-        st.warning(f"⚠️ Nepodařilo se načíst seznam modelů Mistral: {e}")
-        return MISTRAL_PREFERRED
+        return verified if verified else (available_ids[:3] if available_ids else MISTRAL_PREFERRED)
+    except Exception: return MISTRAL_PREFERRED
 
 def get_delay_for_provider(provider):
     if provider == "NVIDIA NIM": return 2.0
-    elif provider == "Gemini": return 6.0
-    elif provider == "Mistral": return 3.0
+    if provider == "Gemini": return 6.0
+    if provider == "Mistral": return 3.0
     return 2.0
 
 def render_downloads():
     base_name = st.session_state.get("file_base_name", "debata")
     md_b64 = base64.b64encode(st.session_state.md_content.encode('utf-8')).decode('utf-8')
     pdf_b64 = base64.b64encode(st.session_state.pdf_bytes).decode('utf-8') if st.session_state.pdf_bytes else ""
-    md_href = f"data:application/octet-stream;base64,{md_b64}"
-    pdf_href = f"data:application/pdf;base64,{pdf_b64}"
+    
     html_code = f"""
-    <div style="display: flex; gap: 10px; font-family: 'Source Sans Pro', sans-serif;">
-        <a href="{md_href}" download="{base_name}.md" style="flex: 1; text-align: center; padding: 10px; background-color: #f0f2f6; color: #31333f; text-decoration: none; border-radius: 5px; border: 1px solid #d6d6d6; font-size: 16px;">📥 Stáhnout jako Markdown (.md)</a>
-        <a href="{pdf_href}" download="{base_name}.pdf" style="flex: 1; text-align: center; padding: 10px; background-color: #ff4b4b; color: white; text-decoration: none; border-radius: 5px; font-size: 16px;">📄 Stáhnout jako PDF (.pdf)</a>
+    <div style="display: flex; gap: 10px;">
+        <a href="data:application/octet-stream;base64,{md_b64}" download="{base_name}.md" style="flex: 1; text-align: center; padding: 10px; background-color: #f0f2f6; color: #31333f; text-decoration: none; border-radius: 5px; border: 1px solid #d6d6d6; font-size: 16px;">📥 Stáhnout jako Markdown (.md)</a>
+        <a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" style="flex: 1; text-align: center; padding: 10px; background-color: #ff4b4b; color: white; text-decoration: none; border-radius: 5px; font-size: 16px;">📄 Stáhnout jako PDF (.pdf)</a>
     </div>
     """
     components.html(html_code, height=60)
@@ -230,104 +198,53 @@ def build_critique_prompt(md_content, topic):
 3. **Recenze verdiktu:** Byl verdikt rozhodčího oprávněný? Bylo odůvodnění přesvědčivé?
 4. **Silné a slabé stránky** obou diskutujících.
 5. **Návrh vyváženějšího verdiktu**, pokud s ním nesouhlasíš.
-6. **Doporučení** pro zlepšení příští diskuze.
 
 **Text diskuze:**
 
 {md_content}
 """
 
-def get_presigned_url(key, expires_in=3600):
-    """Vygeneruje dočasnou veřejnou URL k soukromému souboru na R2."""
-    try:
-        s3 = get_r2_client()
-        bucket = st.secrets["R2_BUCKET_NAME"]
-        return s3.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': bucket, 'Key': key},
-            ExpiresIn=expires_in
-        )
-    except Exception as e:
-        st.warning(f"⚠️ Nepodařilo se vygenerovat presigned URL: {e}")
-        return None
-
 def call_critique_api(system_prompt, user_prompt, provider, keys):
-    """Samostatné volání API pro kritiku – nezávislé na běhu debaty."""
     if provider == "Gemini":
         client = genai.Client(api_key=keys["gemini"], http_options=types.HttpOptions(timeout=180000))
-        models = get_available_gemini_models(client)
-        full = f"{system_prompt}\n\n---\n\n{user_prompt}"
-        last_err = None
-        for model in models:
+        for model in get_available_gemini_models(client):
             try:
-                r = client.models.generate_content(model=model, contents=full, config=types.GenerateContentConfig())
-                if r.text and r.text.strip():
-                    return r.text, model
-            except Exception as e:
-                last_err = e
-        raise Exception(f"Kritika přes Gemini selhala: {last_err}")
-
+                r = client.models.generate_content(model=model, contents=f"{system_prompt}\n\n---\n\n{user_prompt}", config=types.GenerateContentConfig())
+                if r.text and r.text.strip(): return r.text, model
+            except Exception: pass
+        raise Exception("Kritika přes Gemini selhala.")
     elif provider == "NVIDIA NIM":
         client = OpenAI(api_key=keys["nim"], base_url="https://integrate.api.nvidia.com/v1", timeout=180.0)
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        last_err = None
         for model in NVIDIA_PREFERRED:
             try:
-                r = client.chat.completions.create(model=model, messages=messages, temperature=0.7)
-                if r.choices[0].message.content:
-                    return r.choices[0].message.content, model
-            except Exception as e:
-                last_err = e
-        raise Exception(f"Kritika přes NVIDIA selhala: {last_err}")
-
+                r = client.chat.completions.create(model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], temperature=0.7)
+                if r.choices[0].message.content: return r.choices[0].message.content, model
+            except Exception: pass
+        raise Exception("Kritika přes NVIDIA selhala.")
     elif provider == "Mistral":
         client = OpenAI(api_key=keys["mistral"], base_url="https://api.mistral.ai/v1", timeout=180.0)
-        models = get_available_mistral_models(client)
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        last_err = None
-        for model in models:
+        for model in get_available_mistral_models(client):
             try:
-                r = client.chat.completions.create(model=model, messages=messages, temperature=0.7)
-                if r.choices[0].message.content:
-                    return r.choices[0].message.content, model
-            except Exception as e:
-                last_err = e
-        raise Exception(f"Kritika přes Mistral selhala: {last_err}")
-
-    raise Exception(f"Neznámý poskytovatel: {provider}")
+                r = client.chat.completions.create(model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], temperature=0.7)
+                if r.choices[0].message.content: return r.choices[0].message.content, model
+            except Exception: pass
+        raise Exception("Kritika přes Mistral selhala.")
+    raise Exception("Neznámý poskytovatel.")
 
 def generate_critique_md(critique_text, model_used, topic):
     ts = datetime.now().strftime('%d.%m.%Y %H:%M')
-    return f"""# Nezávislá kritika diskuze
-
-**Téma:** {topic}  
-**Datum kritiky:** {ts}  
-**Model kritika:** {model_used}
-
----
-
-{critique_text}
-"""
+    return f"# Nezávislá kritika diskuze\n\n**Téma:** {topic}  \n**Datum:** {ts}  \n**Model kritika:** {model_used}\n\n---\n\n{critique_text}\n"
 
 def save_critique_to_r2(base_name, md_content, pdf_bytes):
-    """Uloží kritiku na R2 do VERDICT/markdown/ a VERDICT/pdf/."""
     try:
         s3 = get_r2_client()
         bucket = st.secrets["R2_BUCKET_NAME"]
-        s3.put_object(
-            Bucket=bucket, Key=f"VERDICT/markdown/{base_name}.md",
-            Body=md_content.encode("utf-8"), ContentType="text/markdown"
-        )
-        s3.put_object(
-            Bucket=bucket, Key=f"VERDICT/pdf/{base_name}.pdf",
-            Body=pdf_bytes, ContentType="application/pdf"
-        )
+        s3.put_object(Bucket=bucket, Key=f"VERDICT/markdown/{base_name}.md", Body=md_content.encode("utf-8"), ContentType="text/markdown")
+        s3.put_object(Bucket=bucket, Key=f"VERDICT/pdf/{base_name}.pdf", Body=pdf_bytes, ContentType="application/pdf")
         return True, None
-    except Exception as e:
-        return False, str(e)
+    except Exception as e: return False, str(e)
 
 def save_critique_result(critique_text, model_used):
-    """Vygeneruje PDF, uloží do session_state i na R2 a vrátí výsledek."""
     base_name = f"{st.session_state.file_base_name}_kritika"
     md_content = generate_critique_md(critique_text, model_used, st.session_state.current_topic)
     pdf_bytes = generate_pdf(md_content)
@@ -338,44 +255,28 @@ def save_critique_result(critique_text, model_used):
     return ok, err, base_name
 
 def build_critique_html(md_content, base_name):
-    """Sestaví plnohodnotný HTML dokument pro nový panel prohlížeče."""
     md_html = markdown.markdown(md_content, extensions=['tables', 'nl2br'])
     md_b64 = base64.b64encode(md_content.encode('utf-8')).decode('utf-8')
     pdf_b64 = base64.b64encode(st.session_state.critique_pdf).decode('utf-8') if st.session_state.critique_pdf else ""
 
-    return f"""<!DOCTYPE html>
-<html lang="cs">
-<head>
-<meta charset="utf-8">
-<title>Kritika – {base_name}</title>
+    return f"""<!DOCTYPE html><html lang="cs"><head><meta charset="utf-8"><title>Kritika – {base_name}</title>
 <style>
-    body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; max-width: 900px; margin: 30px auto; padding: 20px; line-height: 1.65; color: #2d3748; background: #fff; }}
-    h1 {{ color: #1a365d; border-bottom: 3px solid #3182ce; padding-bottom: 12px; }}
-    h2 {{ color: #2c5282; margin-top: 28px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; }}
-    h3 {{ color: #2b6cb0; }}
-    .controls {{ position: sticky; top: 0; background: #fff; padding: 15px 0; border-bottom: 1px solid #eee; margin-bottom: 25px; display: flex; gap: 10px; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }}
-    .btn {{ flex: 1; text-align: center; padding: 12px 16px; text-decoration: none; border-radius: 6px; border: none; cursor: pointer; font-size: 15px; font-family: inherit; font-weight: 600; transition: opacity 0.2s; }}
+    body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 30px auto; padding: 20px; line-height: 1.65; color: #2d3748; }}
+    .controls {{ position: sticky; top: 0; background: #fff; padding: 15px 0; border-bottom: 1px solid #eee; margin-bottom: 25px; display: flex; gap: 10px; z-index: 100; }}
+    .btn {{ flex: 1; text-align: center; padding: 12px; text-decoration: none; border-radius: 6px; border: none; cursor: pointer; font-size: 15px; font-weight: 600; }}
     .btn-md {{ background: #f0f2f6; color: #31333f; border: 1px solid #d6d6d6; }}
     .btn-pdf {{ background: #ff4b4b; color: #fff; }}
     .btn-close {{ background: #4a5568; color: #fff; }}
-    .btn:hover {{ opacity: 0.85; }}
-    blockquote {{ border-left: 4px solid #cbd5e0; padding-left: 15px; color: #4a5568; background: #f7fafc; padding: 10px 15px; margin: 15px 0; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
-    th, td {{ border: 1px solid #e2e8f0; padding: 8px 12px; text-align: left; }}
-    th {{ background: #edf2f7; }}
-    code {{ background: #f7fafc; padding: 2px 6px; border-radius: 3px; font-family: 'Consolas', monospace; font-size: 0.92em; }}
-    pre {{ background: #f7fafc; padding: 12px; border-radius: 6px; overflow-x: auto; }}
-</style>
-</head>
-<body>
+    blockquote {{ border-left: 4px solid #cbd5e0; padding-left: 15px; color: #4a5568; background: #f7fafc; padding: 10px 15px; }}
+    table {{ width: 100%; border-collapse: collapse; }} th, td {{ border: 1px solid #e2e8f0; padding: 8px 12px; }}
+</style></head><body>
 <div class="controls">
     <a href="data:application/octet-stream;base64,{md_b64}" download="{base_name}.md" class="btn btn-md">📥 Stáhnout .md</a>
     <a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" class="btn btn-pdf">📄 Stáhnout .pdf</a>
     <button class="btn btn-close" onclick="window.close()">✖ Zavřít</button>
 </div>
 {md_html}
-</body>
-</html>"""
+</body></html>"""
 
 def reset_critique_state():
     st.session_state.critique_md = ""
@@ -383,218 +284,105 @@ def reset_critique_state():
     st.session_state.critique_base = ""
     st.session_state.show_critique_ui = False
 
-def render_perplexity_ui():
-    """Manuální + volitelná automatická cesta pro Perplexity."""
-    st.info(
-        "💡 **Perplexity nespolehlivě načítá `.md` soubory z URL.** "
-        "Nejlepší cesta je **manuální**: stáhněte PDF, přiložte ho v Perplexity a vložte prompt."
-    )
-
-    if st.session_state.file_base_name == "debata":
-        st.error("⚠️ Soubor diskuze nebyl nahrán na R2. Použijte prosím API variantu výše.")
-        return
-
-    base_name = st.session_state.file_base_name
-    topic = st.session_state.current_topic
-
-    # === KROK 1: Stáhnout PDF ===
-    st.markdown("#### Krok 1 – Stáhněte si diskuzi jako PDF")
-    pdf_b64 = base64.b64encode(st.session_state.pdf_bytes).decode('utf-8') if st.session_state.pdf_bytes else ""
-    st.markdown(
-        f'<a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" '
-        f'style="display:block; text-align:center; padding:12px; background:#ff4b4b; color:white; '
-        f'text-decoration:none; border-radius:6px; font-weight:600;">'
-        f'📄 Stáhnout {base_name}.pdf</a>',
-        unsafe_allow_html=True
-    )
-
-    # === KROK 2: Otevřít Perplexity ===
-    st.markdown("#### Krok 2 – Otevřete Perplexity v novém panelu")
-    components.html(
-        '<a href="https://www.perplexity.ai/" target="_blank" rel="noopener noreferrer" '
-        'style="display:block; text-align:center; padding:12px; background:#20b8cd; color:white; '
-        'text-decoration:none; border-radius:6px; font-weight:600; font-family:\'Source Sans Pro\', sans-serif;">'
-        '🔗 Otevřít Perplexity</a>',
-        height=50
-    )
-
-    # === KROK 3: Zkopírovat prompt ===
-    st.markdown("#### Krok 3 – Zkopírujte prompt a vložte ho do Perplexity")
-    prompt_for_perplexity = (
-        f"Vyhodnoť mi tuto diskuzi na téma: \"{topic}\". "
-        f"Její relevantnost a recenzuj verdikt rozhodčího.\n\n"
-        f"Zaměř se na:\n"
-        f"1. Relevantnost diskuze k zadanému tématu.\n"
-        f"2. Kvalitu argumentace obou stran – kde byly přesvědčivé, kde slabé.\n"
-        f"3. Recenzi verdiktu rozhodčího – byl oprávněný? Bylo odůvodnění přesvědčivé?\n"
-        f"4. Silné a slabé stránky obou diskutujících.\n"
-        f"5. Návrh vyváženějšího verdiktu, pokud s ním nesouhlasíš.\n"
-        f"6. Doporučení pro zlepšení příští diskuze.\n\n"
-        f"(Přiložený PDF soubor obsahuje celou diskuzi včetně verdiktu rozhodčího.)"
-    )
-    st.code(prompt_for_perplexity, language=None)
-
-    st.caption("💡 Po najetí myší na blok výše se objeví ikona 📋 pro zkopírování.")
-
-    # === KROK 4: Vložit výsledek ===
-    st.markdown("#### Krok 4 – Vložte sem výsledek kritiky z Perplexity")
-    pasted = st.text_area(
-        "Výsledek z Perplexity:",
-        height=200,
-        key="critique_pasted_perplexity",
-        label_visibility="collapsed",
-        placeholder="Sem vložte text kritiky, který jste zkopírovali z Perplexity..."
-    )
-    if st.button("💾 Uložit kritiku na R2", type="primary", use_container_width=True):
-        if pasted.strip():
-            ok, err, saved_base = save_critique_result(pasted, "Perplexity (manuálně)")
-            if ok:
-                st.success(f"✅ Uloženo jako `VERDICT/markdown/{saved_base}.md` a `VERDICT/pdf/{saved_base}.pdf`.")
-            else:
-                st.warning(f"⚠️ Uložení selhalo: {err}")
-            # ŽÁDNÝ st.rerun() – UI se vykreslí ve stejném běhu
-        else:
-            st.error("Nejprve vložte text kritiky.")
-
-    # === VOLITELNÉ: Automatická cesta ===
-    with st.expander("⚙️ Pokročilé – zkusit automaticky přes PDF URL (může selhat)"):
-        st.caption(
-            "Tato cesta vygeneruje **presigned URL** k PDF souboru na R2 (platnost 1 hodina) "
-            "a pokusí se otevřít Perplexity s promptem obsahujícím tuto URL. "
-            "**Může selhat**, protože Perplexity nemá vždy stabilní extrakci obsahu z URL. "
-            "Pokud selže, použijte manuální cestu výše."
-        )
-        if st.button("🔗 Otevřít Perplexity s PDF URL", key="pplx_auto_btn"):
-            presigned = get_presigned_url(f"pdf/{base_name}.pdf", expires_in=3600)
-            if presigned:
-                short_prompt = (
-                    f"Přečti obsah PDF souboru na této URL a proveď nezávislou kritiku diskuze na téma '{topic}'. "
-                    f"Zhodnoť relevanci, kvalitu argumentace obou stran a kriticky recenzuj verdikt rozhodčího. "
-                    f"Navrhni vyváženější verdikt, pokud s ním nesouhlasíš. "
-                    f"URL (platnost 1 hodina): {presigned}"
-                )
-                pplx_url = f"https://www.perplexity.ai/search?q={urllib.parse.quote(short_prompt)}"
-                components.html(
-                    f'<script>window.open({json.dumps(pplx_url)}, "_blank", "noopener,noreferrer");</script>',
-                    height=0
-                )
-                st.info("📋 Pokud Perplexity obsah nenačte, použijte manuální cestu výše.")
-            else:
-                st.error("Nepodařilo se vygenerovat presigned URL.")
-
 def render_critique_ui(available_providers_list):
-    """UI nezávislé kritiky – volá se za render_downloads()."""
-    if not st.session_state.md_content:
-        return
+    if not st.session_state.md_content: return
 
     st.divider()
     st.subheader("🔍 Nezávislá kritika diskuze")
     st.caption("Nechte diskuzi a verdikt rozhodčího posoudit další nezávislou AI.")
 
-    # Tlačítko pro otevření UI – BEZ st.rerun()
     if not st.session_state.show_critique_ui and not st.session_state.critique_md:
         if st.button("Spustit nezávislou kritiku", type="primary", use_container_width=True):
             st.session_state.show_critique_ui = True
-            # ŽÁDNÝ st.rerun() – vykreslí se ve stejném běhu
 
-    # UI se zobrazí, pokud je aktivní
-    if not (st.session_state.show_critique_ui or st.session_state.critique_md):
-        return
+    if not (st.session_state.show_critique_ui or st.session_state.critique_md): return
 
-    # Výběr kritika
-    options = []
-    if "Gemini" in available_providers_list:
-        options.append("Gemini (API)")
-    if "Mistral" in available_providers_list:
-        options.append("Mistral (API)")
-    if "NVIDIA NIM" in available_providers_list:
-        options.append("NVIDIA NIM (API)")
-    options.append("Perplexity (externí – nový panel)")
+    # Rozdělení na taby
+    tab_api, tab_ext = st.tabs(["🤖 Přímé API (automatické)", "🌐 Externí AI chat (manuální)"])
 
-    if not available_providers_list:
-        st.warning("⚠️ Nemáte zadán žádný API klíč – můžete použít pouze externí Perplexity.")
+    with tab_api:
+        if not available_providers_list:
+            st.warning("⚠️ Pro přímé API nemáte zadaný žádný klíč. Použijte záložku Externí AI chat.")
+        else:
+            options = [f"{p} (API)" for p in available_providers_list]
+            selected = st.selectbox("Vyberte API kritika:", options, key="critique_api_provider")
+            provider = selected.replace(" (API)", "")
+            
+            if st.button(f"🚀 Generovat kritiku pomocí {provider}", type="primary"):
+                keys = {"gemini": st.session_state.gemini_key.strip(), "nim": st.session_state.nim_key.strip(), "mistral": st.session_state.mistral_key.strip()}
+                with st.spinner(f"{provider} generuje kritiku..."):
+                    try:
+                        critique_text, model_used = call_critique_api(CRITIQUE_SYSTEM_PROMPT, build_critique_prompt(st.session_state.md_content, st.session_state.current_topic), provider, keys)
+                        ok, err, base_name = save_critique_result(critique_text, model_used)
+                        if ok: st.success(f"✅ Uloženo na R2 (VERDICT/markdown a /pdf).")
+                        else: st.warning(f"⚠️ Uloženo lokálně, ale R2 selhalo: {err}")
+                    except Exception as e:
+                        st.error(f"Chyba: {e}")
 
-    selected = st.selectbox("Vyberte kritika:", options, key="critique_provider_select")
-    is_perplexity = "Perplexity" in selected
+    with tab_ext:
+        st.info("💡 **Externí chat:** Zkopírujte prompt, přiložte PDF diskuzi a nechte AI vyhodnotit. Poté výsledek vložte zpět.")
+        
+        # Krok 1: PDF
+        pdf_b64 = base64.b64encode(st.session_state.pdf_bytes).decode('utf-8') if st.session_state.pdf_bytes else ""
+        st.markdown(f'<a href="data:application/pdf;base64,{pdf_b64}" download="{st.session_state.file_base_name}.pdf" style="display:block; text-align:center; padding:10px; background:#ff4b4b; color:white; text-decoration:none; border-radius:6px; font-weight:600;">1. 📄 Stáhnout PDF diskuze</a>', unsafe_allow_html=True)
+        
+        # Krok 2: Odkazy na chaty
+        st.markdown("**2. Otevřete váš oblíbený AI chat:**")
+        chats = {
+            "ChatGPT": "https://chatgpt.com/", "Claude": "https://claude.ai/new",
+            "Gemini": "https://gemini.google.com/app", "Perplexity": "https://www.perplexity.ai/",
+            "DeepSeek": "https://chat.deepseek.com/", "Copilot": "https://copilot.microsoft.com/",
+            "Le Chat (Mistral)": "https://chat.mistral.ai/chat"
+        }
+        cols = st.columns(4)
+        for i, (name, url) in enumerate(chats.items()):
+            cols[i % 4].markdown(f'<a href="{url}" target="_blank" style="display:block; text-align:center; padding:8px; background:#e2e8f0; color:#2d3748; text-decoration:none; border-radius:5px; margin-bottom:5px; font-size:14px;">{name}</a>', unsafe_allow_html=True)
 
-    if not is_perplexity:
-        provider = selected.replace(" (API)", "")
-        if st.button(f"🚀 Generovat kritiku pomocí {provider}", type="primary", use_container_width=True):
-            keys = {
-                "gemini": st.session_state.gemini_key.strip(),
-                "nim": st.session_state.nim_key.strip(),
-                "mistral": st.session_state.mistral_key.strip(),
-            }
-            with st.spinner(f"{provider} generuje nezávislou kritiku..."):
-                try:
-                    critique_text, model_used = call_critique_api(
-                        CRITIQUE_SYSTEM_PROMPT,
-                        build_critique_prompt(st.session_state.md_content, st.session_state.current_topic),
-                        provider,
-                        keys,
-                    )
-                    ok, err, base_name = save_critique_result(critique_text, model_used)
-                    if ok:
-                        st.success(f"✅ Kritika uložena na R2 do `VERDICT/markdown/{base_name}.md` a `VERDICT/pdf/{base_name}.pdf`.")
-                    else:
-                        st.warning(f"⚠️ Kritika vygenerována, ale uložení na R2 selhalo: {err}")
-                    # ŽÁDNÝ st.rerun() – UI kritiky se vykreslí níže
-                except Exception as e:
-                    st.error(f"Chyba při generování kritiky: {e}")
-
-    else:
-        render_perplexity_ui()
+        # Krok 3: Prompt
+        st.markdown("**3. Zkopírujte prompt a vložte ho do chatu (spolu s PDF):**")
+        prompt_for_ext = f"Přečti přiložené PDF s diskuzí na téma: '{st.session_state.current_topic}'. Proveď nezávislou kritiku: zhodnoť relevanci, kvalitu argumentace obou stran a recenzuj verdikt rozhodčího. Navrhni vyváženější verdikt, pokud s ním nesouhlasíš."
+        st.code(prompt_for_ext, language=None)
+        
+        # Krok 4: Vložení výsledku
+        st.markdown("**4. Vložte sem výsledek kritiky z externího chatu:**")
+        pasted = st.text_area("Výsledek:", height=150, key="critique_pasted_ext", label_visibility="collapsed", placeholder="Sem vložte text...")
+        if st.button("💾 Uložit kritiku na R2", key="btn_save_ext"):
+            if pasted.strip():
+                ok, err, base_name = save_critique_result(pasted, "Externí AI (manuálně)")
+                if ok: st.success(f"✅ Uloženo jako `VERDICT/.../{base_name}...`.")
+                else: st.warning(f"⚠️ Uloženo lokálně, ale R2 selhalo: {err}")
+            else:
+                st.error("Nejprve vložte text kritiky.")
 
     # Zobrazení hotové kritiky
     if st.session_state.critique_md:
         st.divider()
         st.subheader("✅ Hotová kritika")
-        st.caption(f"Uloženo jako: `VERDICT/markdown/{st.session_state.critique_base}.md` a `VERDICT/pdf/{st.session_state.critique_base}.pdf`")
-
+        
         md_b64 = base64.b64encode(st.session_state.critique_md.encode('utf-8')).decode('utf-8')
         pdf_b64 = base64.b64encode(st.session_state.critique_pdf).decode('utf-8')
-        base_name = st.session_state.critique_base
-
+        
+        # Tlačítka pro stažení
         st.markdown(
             f'<div style="display:flex; gap:10px; margin:10px 0;">'
-            f'<a href="data:application/octet-stream;base64,{md_b64}" download="{base_name}.md" '
-            f'style="flex:1; text-align:center; padding:10px; background:#f0f2f6; color:#31333f; text-decoration:none; border-radius:5px; border:1px solid #d6d6d6;">📥 Kritika (.md)</a>'
-            f'<a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" '
-            f'style="flex:1; text-align:center; padding:10px; background:#ff4b4b; color:white; text-decoration:none; border-radius:5px;">📄 Kritika (.pdf)</a>'
-            f'</div>',
+            f'<a href="data:application/octet-stream;base64,{md_b64}" download="{st.session_state.critique_base}.md" style="flex:1; text-align:center; padding:10px; background:#f0f2f6; color:#31333f; text-decoration:none; border-radius:5px; border:1px solid #d6d6d6;">📥 Kritika (.md)</a>'
+            f'<a href="data:application/pdf;base64,{pdf_b64}" download="{st.session_state.critique_base}.pdf" style="flex:1; text-align:center; padding:10px; background:#ff4b4b; color:white; text-decoration:none; border-radius:5px;">📄 Kritika (.pdf)</a>'
+            f'</div>', unsafe_allow_html=True
+        )
+
+        # Otevření v novém panelu (Použití <a> tagu místo JS, aby to prohlížeče neblokovaly)
+        html_content = build_critique_html(st.session_state.critique_md, st.session_state.critique_base)
+        html_b64 = base64.b64encode(html_content.encode('utf-8')).decode('utf-8')
+        
+        st.markdown(
+            f'<a href="data:text/html;base64,{html_b64}" target="_blank" style="display:block; text-align:center; padding:12px; background:#4b8bf4; color:white; text-decoration:none; border-radius:6px; font-weight:600; margin-top:10px;">🔗 Otevřít kritiku v novém panelu prohlížeče</a>',
             unsafe_allow_html=True
         )
-
-        # Tlačítko pro otevření nového panelu s kritikou
-        html_full = build_critique_html(st.session_state.critique_md, base_name)
-        html_b64 = base64.b64encode(html_full.encode('utf-8')).decode('utf-8')
-
-        components.html(
-            f'<button onclick="openCritique()" '
-            f'style="padding:12px 24px; background:#4b8bf4; color:white; border:none; border-radius:6px; '
-            f'cursor:pointer; font-size:16px; width:100%; font-weight:600; font-family:inherit;">'
-            f'🔗 Otevřít kritiku v novém panelu prohlížeče</button>'
-            f'<script>'
-            f'function openCritique() {{'
-            f'  try {{'
-            f'    const binary = atob("{html_b64}");'
-            f'    const bytes = new Uint8Array(binary.length);'
-            f'    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);'
-            f'    const html = new TextDecoder("utf-8").decode(bytes);'
-            f'    const blob = new Blob([html], {{type: "text/html;charset=utf-8"}});'
-            f'    const url = URL.createObjectURL(blob);'
-            f'    const w = window.open(url, "_blank", "noopener,noreferrer");'
-            f'    if (!w) alert("⚠️ Panel byl zablokován. Povolte vyskakovací okna pro tuto stránku.");'
-            f'  }} catch (e) {{ alert("Chyba: " + e.message); }}'
-            f'}}'
-            f'</script>',
-            height=70
-        )
-
+        
         with st.expander("📄 Náhled kritiky", expanded=False):
             st.markdown(st.session_state.critique_md)
 
-# Načtení klíčů ze Secrets (pokud jsou nastaveny)
+# Načtení klíčů ze Secrets
 try: secret_gemini = st.secrets["GEMINI_API_KEY"]
 except: secret_gemini = ""
 try: secret_nim = st.secrets["NVIDIA_NIM_API_KEY"]
@@ -655,82 +443,70 @@ with st.sidebar:
 
 if app_mode == "❓ Nápověda a návody":
     st.title("📖 Nápověda a návody")
+    
     st.markdown("""
-    Vítejte v AI Debatní Aréně! Zde najdete všechny informace k tomu, jak aplikaci ovládat a kde získat potřebné přístupy.
-
-    ## 🚀 Obecný postup
-    1. **Získejte API klíč:** Vyberte si alespoň jednoho poskytovatele AI (Gemini, NVIDIA NIM nebo Mistral). Postupy najdete níže.
-    2. **Vložte klíč:** V postranním panelu vložte váš klíč do příslušného pole.
-    3. **Nastavte osobnosti:** Zadejte jména diskutujících, vyberte jejich poskytovatele a napište instrukce (nebo nahrajte PDF/MD soubor).
-    4. **Zadejte téma a spusťte:** Napište téma diskuze (nebo nahrajte dokumenty), zvolte počet kol a klikněte na **Spustit diskuzi**.
-    5. **Exportujte:** Po skončení debaty si můžete průběh a verdikt rozhodčího stáhnout jako Markdown nebo PDF.
-    6. **Nezávislá kritika:** Po skončení debaty můžete nechat diskuzi posoudit další AI – buď přes API (Gemini/Mistral/NVIDIA), nebo přes externí Perplexity.
-
-    ---
-    ## 🔑 Kde získat API klíče a jaké jsou limity
+    ## Proč používat AI Debatní Arénu? (3 hlavní výhody)
+    1. **Odstraňuje bias jedné AI:** Klasický chat Vám řekne jen jeden názor. Aréna postaví proti sobě dva různé agenty s odlišnými osobnostmi (např. liberál vs. tradicionalista, nebo optimista vs. pesimista), což odhalí slabiny v argumentech mnohem lépe.
+    2. **Objektivní rozhodčí:** Po skončení debaty nastupuje třetí nezávislá AI (rozhodčí), která má za úkol nestranně zvážit argumenty obou stran a vynést jasný verdikt.
+    3. **Hlubší analýza:** Díky automatickému střídání replik a možnosti nahrát podkladové dokumenty (PDF) jde o precizní nástroj pro analýzu složitých témat (politika, filozofie, vědecké studie).
     """)
 
-    with st.expander("🔵 Google Gemini (Doporučeno pro vyhledávání)"):
+    st.divider()
+    st.markdown("""
+    ## 🚀 Jak začít
+    K provozu aplikace **bohatě stačí jeden API klíč**. Nemusíte zakládat účty u všech poskytovatelů.
+    *   **Nejjednodušší volba je Google Gemini.** Pokud máte účet Google (Gmail), máte pravděpodobně přístup i do Google AI Studia, kde klíč získáte během 30 vteřin zdarma.
+    *   Ostatní klíče (NVIDIA, Mistral) jsou zde jako alternativa pro specifické modely nebo jako záloha, pokud by Vám došly limity.
+    """)
+
+    with st.expander("🔵 Google Gemini (Nejjednodušší na získání)"):
         st.markdown("""
         **Jak získat klíč:**
         1. Jděte na [Google AI Studio](https://aistudio.google.com/app/apikey).
-        2. Přihlaste se vaším Google účtem.
+        2. Přihlaste se vaším Google účtem (Gmail).
         3. Klikněte na **Create API key** (Vytvořit API klíč).
-        4. Zkopírujte vygenerovaný klíč (začíná na `AIza...`).
+        4. Zkopírujte vygenerovaný klíč (začíná na `AIza...`) a vložte ho do postranního panelu.
 
-        **Limity (Free tier):**
-        *   Rychlost: ~15 požadavků za minutu (RPM) pro Flash-Lite modely.
-        *   Denní limit: 500 až 1 500 požadavků (podle modelu).
-        *   *Upozornění:* Pokud zapnete vyhledávání na internetu, spotřebováváte speciální kvótu, která se může vyčerpat rychleji a způsobit chybu 429.
+        **Limity (Free tier):** Zcela zdarma. Rychlost ~15 požadavků za minutu, denní limit 500 až 1 500 požadavků (pro běžnou debatu to stačí mnohonásobně).
         """)
 
-    with st.expander("🟢 NVIDIA NIM (Doporučeno pro rychlost)"):
+    with st.expander("🟢 NVIDIA NIM (Rychlost a velké modely)"):
         st.markdown("""
         **Jak získat klíč:**
         1. Jděte na [NVIDIA Build](https://build.nvidia.com/).
         2. Zaregistrujte se.
         3. Klikněte na své jméno vpravo nahoře -> **API Keys**.
         4. Vygenerujte nový klíč (začíná na `nvapi-...`).
-        *(Ujistěte se, že váš klíč má oprávnění "Public API Endpoints", jinak se mohou objevit chyby 404.)*
 
-        **Limity (Free tier):**
-        *   Rychlost: ~40 požadavků za minutu (RPM).
-        *   Tokeny: Bez přísného limitu (velmi štědré).
+        **Limity (Free tier):** Štědré limity (~40 požadavků za minutu), skvělé pro dlouhé texty.
         """)
 
-    with st.expander("🟠 Mistral AI (Doporučeno pro dlouhé texty)"):
+    with st.expander("🟠 Mistral AI (Alternativa)"):
         st.markdown("""
         **Jak získat klíč:**
         1. Jděte na [Mistral Console](https://console.mistral.ai/).
-        2. Zaregistrujte se (ověření telefonem, platební karta není nutná).
-        3. V levém menu přejděte na **API Keys**.
-        4. Klikněte na **Create new key** (Vytvořit nový klíč).
-
-        **Limity (Free tier):**
-        *   Rychlost: Záleží na modelu (obvykle 1 až 12 požadavků za sekundu).
-        *   Denní limit: Několik tisíc požadavků.
+        2. Zaregistrujte se (stačí telefon).
+        3. V levém menu přejděte na **API Keys** -> **Create new key**.
         """)
-
+        
     with st.expander("🟣 Nezávislá kritika – jak to funguje"):
         st.markdown("""
         Po skončení debaty si můžete nechat diskuzi a verdikt rozhodčího posoudit další AI:
-
-        **API varianta (Gemini, Mistral, NVIDIA NIM):**
-        * Plně automatizované – server zavolá API, vygeneruje kritiku a uloží ji na R2 do `VERDICT/markdown/` a `VERDICT/pdf/`.
-
-        **Externí varianta (Perplexity):**
-        * Perplexity **nespolehlivě načítá `.md` soubory z URL**. Proto doporučujeme **manuální cestu**:
-          1. Stáhněte si PDF diskuze (tlačítko v UI).
-          2. Otevřete Perplexity v novém panelu.
-          3. Přiložte PDF a vložte připravený prompt.
-          4. Výsledek zkopírujte zpět do aplikace.
-        * V aplikaci je i **pokročilá možnost** s presigned URL (dočasný podepsaný odkaz na PDF v R2), ale ta nemusí fungovat.
-
-        **Výhody presigned URL:** Váš R2 bucket zůstává **soukromý** – presigned URL je dočasná (1 h) a nepředvídatelná.
+        
+        *   **Přímé API:** Pokud máte v aplikaci klíč, kritiku vygeneruje přímo server a uloží ji na R2.
+        *   **Externí chat:** Pokud chcete využít lepší model (např. placený ChatGPT Plus nebo Claude), stáhněte si PDF diskuze, otevřete odkaz na chat a vložte tam připravený prompt. Výsledek pak zkopírujete zpět do aplikace a uložíte.
         """)
+
 
 elif app_mode == "⚔️ Debatní Aréna":
     st.title("🗣️ AI Debatní Aréna")
+    
+    # Upozornění na klíče na hlavní obrazovce
+    if not available_providers:
+        st.error("⚠️ **Nemáte zadán žádný API klíč!** Pro spuštění debaty přejděte do postranního panelu vlevo a vložte alespoň jeden klíč.")
+    else:
+        st.info("💡 **Tip:** K provozu arény bohatě stačí **jeden API klíč**. Pokud žádný nemáte, nejjednodušší je [Google Gemini](#) (stačí vám k tomu jen běžný Google účet).")
+
     st.caption("Automatizovaná diskuze dvou AI osobností s dynamickým výběrem modelů.")
 
     # --- ZADÁNÍ TÉMATU ---
@@ -759,7 +535,7 @@ elif app_mode == "⚔️ Debatní Aréna":
 
     if st.button("🚀 Spustit diskuzi", type="primary"):
         if not available_providers:
-            st.error("⚠️ Pro spuštění diskuze musíte nejprve zadat alespoň jeden API klíč!")
+            st.error("⚠️ Pro spuštění diskuze musíte nejprve zadat alespoň jeden API klíč v postranním panelu!")
             st.stop()
         if not topic.strip() or not st.session_state.role_a_name.strip() or not st.session_state.role_a_prompt.strip() or not st.session_state.role_b_name.strip() or not st.session_state.role_b_prompt.strip():
             st.error("⚠️ Pro spuštění diskuze musíte vyplnit téma a nastavení pro obě osobnosti!")
@@ -787,7 +563,7 @@ elif app_mode == "⚔️ Debatní Aréna":
 
         with st.spinner("Zjišťuji aktuálně dostupné modely..."):
             gemini_models = get_available_gemini_models(gemini_client) if gemini_client else []
-            nvidia_models = get_available_nvidia_models(nim_client) if nim_client else []
+            nvidia_models = NVIDIA_PREFERRED if nim_client else []
             mistral_models = get_available_mistral_models(mistral_client) if mistral_client else []
 
         model_info = []
@@ -805,81 +581,55 @@ elif app_mode == "⚔️ Debatní Aréna":
         def call_ai(system_prompt, user_prompt, provider):
             full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
             if provider == "Gemini":
-                config = types.GenerateContentConfig()
-                last_error = None
                 for model_name in gemini_models:
                     for attempt in range(2):
                         try:
-                            response = gemini_client.models.generate_content(model=model_name, contents=full_prompt, config=config)
-                            if not response.text or not response.text.strip():
-                                raise Exception("Model Gemini vrátil prázdnou odpověď.")
-                            return response.text, model_name
+                            response = gemini_client.models.generate_content(model=model_name, contents=full_prompt, config=types.GenerateContentConfig())
+                            if response.text and response.text.strip(): return response.text, model_name
                         except Exception as e:
-                            last_error = e
                             if getattr(e, 'code', None) in [503, 429] and attempt == 0: time.sleep(2)
                             else: break
-                raise Exception(f"Všechny Gemini modely selhaly: {last_error}")
+                raise Exception("Všechny Gemini modely selhaly.")
 
             elif provider == "NVIDIA NIM":
                 messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-                last_error = None
                 for model_name in nvidia_models:
                     for attempt in range(2):
                         try:
                             response = nim_client.chat.completions.create(model=model_name, messages=messages, temperature=0.7, extra_body={"chat_template_kwargs":{"enable_thinking":True}})
-                            content = response.choices[0].message.content
-                            if not content or not content.strip(): raise Exception("Model NVIDIA vrátil prázdnou odpověď.")
-                            return content, model_name
-                        except Exception as e:
-                            last_error = e
+                            if response.choices[0].message.content: return response.choices[0].message.content, model_name
+                        except Exception:
                             if attempt == 0: time.sleep(2)
                             else: break
-                raise Exception(f"Všechny NVIDIA modely selhaly: {last_error}")
+                raise Exception("Všechny NVIDIA modely selhaly.")
 
             elif provider == "Mistral":
                 messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-                last_error = None
                 for model_name in mistral_models:
                     for attempt in range(2):
                         try:
                             response = mistral_client.chat.completions.create(model=model_name, messages=messages, temperature=0.7)
-                            content = response.choices[0].message.content
-                            if not content or not content.strip(): raise Exception("Model Mistral vrátil prázdnou odpověď.")
-                            return content, model_name
-                        except Exception as e:
-                            last_error = e
+                            if response.choices[0].message.content: return response.choices[0].message.content, model_name
+                        except Exception:
                             if attempt == 0: time.sleep(2)
                             else: break
-                raise Exception(f"Všechny Mistral modely selhaly: {last_error}")
+                raise Exception("Všechny Mistral modely selhaly.")
 
         # --- GENEROVÁNÍ SOUHRNU DOKUMENTŮ ---
         if st.session_state.topic_input_type == "Nahrát soubor(y)" and st.session_state.topic_document_text:
             with st.spinner("Analyzuji nahrané dokumenty a připravuji souhrn s citacemi..."):
-                summary_prompt = (
-                    "Jsi expert na analýzu dokumentů. Z následujících textů vytvoř strukturovaný souhrn. "
-                    "Uveď hlavní teze, klíčová fakta a přímé citace, které by měly být použity v diskuzi. "
-                    "Tento souhrn bude sloužit jako podklad pro debatující strany."
-                )
+                summary_prompt = "Jsi expert na analýzu dokumentů. Z následujících textů vytvoř strukturovaný souhrn. Uveď hlavní teze, klíčová fakta a přímé citace, které by měly být použity v diskuzi."
                 try:
-                    priority = []
-                    if "Gemini" in available_providers: priority.append("Gemini")
-                    if "Mistral" in available_providers: priority.append("Mistral")
-                    if "NVIDIA NIM" in available_providers: priority.append("NVIDIA NIM")
-                    
+                    priority = [p for p in ["Gemini", "Mistral", "NVIDIA NIM"] if p in available_providers]
                     summary_text = None
                     for p in priority:
                         try:
                             summary_text, _ = call_ai(summary_prompt, st.session_state.topic_document_text, p)
                             break
-                        except Exception:
-                            continue
-                    if summary_text:
-                        st.session_state.topic_summary = summary_text
-                    else:
-                        st.session_state.topic_summary = "Nepodařilo se vygenerovat souhrn dokumentů."
+                        except Exception: continue
+                    st.session_state.topic_summary = summary_text or "Nepodařilo se vygenerovat souhrn dokumentů."
                 except Exception as e:
-                    st.warning(f"Chyba při generování souhrnu: {e}")
-                    st.session_state.topic_summary = "Souhrn dokumentů se nepodařilo vygenerovat."
+                    st.session_state.topic_summary = f"Souhrn dokumentů se nepodařilo vygenerovat: {e}"
             
             st.markdown("#### 📄 Úvodní souhrn dokumentů")
             st.info(st.session_state.topic_summary)
@@ -887,8 +637,9 @@ elif app_mode == "⚔️ Debatní Aréna":
 
         debate_context_intro = f"Téma diskuze: '{topic}'.\n\n"
         if st.session_state.topic_summary:
-            debate_context_intro += f"Zde je souhrn z podkladových dokumentů, ze kterého vycházej:\n{st.session_state.topic_summary}\n\n"
+            debate_context_intro += f"Zde je souhrn z podkladových dokumentů:\n{st.session_state.topic_summary}\n\n"
 
+        # ZAHÁJENÍ DISKUZE
         with chat_container.chat_message("user", avatar="🔵"):
             st.markdown(f"**{st.session_state.role_a_name}:**")
             with st.spinner("Zahajuje diskuzi..."):
@@ -897,7 +648,7 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.caption(f"🤖 `{mod_a}`")
         st.session_state.full_history.append((st.session_state.role_a_name, resp_a, mod_a))
 
-        # Smyčka debaty
+        # SMYČKA DEBATY
         for r in range(st.session_state.max_rounds):
             progress_bar.progress((r + 1) / st.session_state.max_rounds)
             time.sleep(get_delay_for_provider(st.session_state.provider_b))
@@ -969,8 +720,7 @@ elif app_mode == "⚔️ Debatní Aréna":
 
             try:
                 counter = get_next_counter()
-            except Exception as e:
-                counter = f"{random.randint(10000, 99999):05d}"
+            except Exception: counter = f"{random.randint(10000, 99999):05d}"
 
             filename_base = generate_filename_from_topic(st.session_state.current_topic, call_ai, available_providers)
             full_base = f"{counter}_{filename_base}"
@@ -981,7 +731,7 @@ elif app_mode == "⚔️ Debatní Aréna":
                 bucket = st.secrets["R2_BUCKET_NAME"]
                 s3.put_object(Bucket=bucket, Key=f"markdown/{full_base}.md", Body=st.session_state.md_content.encode("utf-8"), ContentType="text/markdown")
                 s3.put_object(Bucket=bucket, Key=f"pdf/{full_base}.pdf", Body=st.session_state.pdf_bytes, ContentType="application/pdf")
-                st.success(f"✅ Soubory nahrány na Cloudflare R2 jako `{full_base}.md` a `{full_base}.pdf`.")
+                st.success(f"✅ Soubory nahrány na Cloudflare R2.")
             except Exception as e:
                 st.error(f"❌ Nahrání na R2 selhalo: {e}")
         
@@ -1003,7 +753,7 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.topic_summary = ""
             st.session_state.uploaded_files_hash = ""
             reset_critique_state()
-            st.rerun()  # tady je rerun OK – uživatel čeká kompletní reset
+            st.rerun()
             
         st.stop()
 
@@ -1045,4 +795,4 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.topic_summary = ""
             st.session_state.uploaded_files_hash = ""
             reset_critique_state()
-            st.rerun()  # tady je rerun OK – uživatel čeká kompletní reset
+            st.rerun()
