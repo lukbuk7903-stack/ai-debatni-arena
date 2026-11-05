@@ -254,30 +254,6 @@ def save_critique_result(critique_text, model_used):
     ok, err = save_critique_to_r2(base_name, md_content, pdf_bytes)
     return ok, err, base_name
 
-def build_critique_html(md_content, base_name):
-    md_html = markdown.markdown(md_content, extensions=['tables', 'nl2br'])
-    md_b64 = base64.b64encode(md_content.encode('utf-8')).decode('utf-8')
-    pdf_b64 = base64.b64encode(st.session_state.critique_pdf).decode('utf-8') if st.session_state.critique_pdf else ""
-
-    return f"""<!DOCTYPE html><html lang="cs"><head><meta charset="utf-8"><title>Kritika – {base_name}</title>
-<style>
-    body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 30px auto; padding: 20px; line-height: 1.65; color: #2d3748; }}
-    .controls {{ position: sticky; top: 0; background: #fff; padding: 15px 0; border-bottom: 1px solid #eee; margin-bottom: 25px; display: flex; gap: 10px; z-index: 100; }}
-    .btn {{ flex: 1; text-align: center; padding: 12px; text-decoration: none; border-radius: 6px; border: none; cursor: pointer; font-size: 15px; font-weight: 600; }}
-    .btn-md {{ background: #f0f2f6; color: #31333f; border: 1px solid #d6d6d6; }}
-    .btn-pdf {{ background: #ff4b4b; color: #fff; }}
-    .btn-close {{ background: #4a5568; color: #fff; }}
-    blockquote {{ border-left: 4px solid #cbd5e0; padding-left: 15px; color: #4a5568; background: #f7fafc; padding: 10px 15px; }}
-    table {{ width: 100%; border-collapse: collapse; }} th, td {{ border: 1px solid #e2e8f0; padding: 8px 12px; }}
-</style></head><body>
-<div class="controls">
-    <a href="data:application/octet-stream;base64,{md_b64}" download="{base_name}.md" class="btn btn-md">📥 Stáhnout .md</a>
-    <a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" class="btn btn-pdf">📄 Stáhnout .pdf</a>
-    <button class="btn btn-close" onclick="window.close()">✖ Zavřít</button>
-</div>
-{md_html}
-</body></html>"""
-
 def reset_critique_state():
     st.session_state.critique_md = ""
     st.session_state.critique_pdf = b""
@@ -370,15 +346,6 @@ def render_critique_ui(available_providers_list):
             f'</div>', unsafe_allow_html=True
         )
 
-        # Otevření v novém panelu (Použití <a> tagu místo JS, aby to prohlížeče neblokovaly)
-        html_content = build_critique_html(st.session_state.critique_md, st.session_state.critique_base)
-        html_b64 = base64.b64encode(html_content.encode('utf-8')).decode('utf-8')
-        
-        st.markdown(
-            f'<a href="data:text/html;base64,{html_b64}" target="_blank" style="display:block; text-align:center; padding:12px; background:#4b8bf4; color:white; text-decoration:none; border-radius:6px; font-weight:600; margin-top:10px;">🔗 Otevřít kritiku v novém panelu prohlížeče</a>',
-            unsafe_allow_html=True
-        )
-        
         with st.expander("📄 Náhled kritiky", expanded=False):
             st.markdown(st.session_state.critique_md)
 
@@ -505,7 +472,7 @@ elif app_mode == "⚔️ Debatní Aréna":
     if not available_providers:
         st.error("⚠️ **Nemáte zadán žádný API klíč!** Pro spuštění debaty přejděte do postranního panelu vlevo a vložte alespoň jeden klíč.")
     else:
-        st.info("💡 **Tip:** K provozu arény bohatě stačí **jeden API klíč**. Pokud žádný nemáte, nejjednodušší je [Google Gemini](#) (stačí vám k tomu jen běžný Google účet).")
+        st.info("💡 **Tip:** K provozu arény bohatě stačí **jeden API klíč**. Pokud žádný nemáte, nejjednodušší je [**Google Gemini**](https://aistudio.google.com/app/apikey) (stačí vám k tomu jen běžný Google účet).")
 
     st.caption("Automatizovaná diskuze dvou AI osobností s dynamickým výběrem modelů.")
 
