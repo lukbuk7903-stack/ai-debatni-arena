@@ -237,14 +237,6 @@ def build_critique_prompt(md_content, topic):
 {md_content}
 """
 
-def build_short_prompt_for_perplexity(topic, presigned_url):
-    return (
-        f"Přečti obsah souboru na této URL a proveď nezávislou kritiku diskuze na téma '{topic}'. "
-        f"Zhodnoť relevanci diskuze, kvalitu argumentace obou stran a kriticky recenzuj verdikt rozhodčího. "
-        f"Navrhni vyváženější verdikt, pokud s ním nesouhlasíš. "
-        f"URL souboru (platnost 1 hodina): {presigned_url}"
-    )
-
 def get_presigned_url(key, expires_in=3600):
     """Vygeneruje dočasnou veřejnou URL k soukromému souboru na R2."""
     try:
@@ -391,6 +383,105 @@ def reset_critique_state():
     st.session_state.critique_base = ""
     st.session_state.show_critique_ui = False
 
+def render_perplexity_ui():
+    """Manuální + volitelná automatická cesta pro Perplexity."""
+    st.info(
+        "💡 **Perplexity nespolehlivě načítá `.md` soubory z URL.** "
+        "Nejlepší cesta je **manuální**: stáhněte PDF, přiložte ho v Perplexity a vložte prompt."
+    )
+
+    if st.session_state.file_base_name == "debata":
+        st.error("⚠️ Soubor diskuze nebyl nahrán na R2. Použijte prosím API variantu výše.")
+        return
+
+    base_name = st.session_state.file_base_name
+    topic = st.session_state.current_topic
+
+    # === KROK 1: Stáhnout PDF ===
+    st.markdown("#### Krok 1 – Stáhněte si diskuzi jako PDF")
+    pdf_b64 = base64.b64encode(st.session_state.pdf_bytes).decode('utf-8') if st.session_state.pdf_bytes else ""
+    st.markdown(
+        f'<a href="data:application/pdf;base64,{pdf_b64}" download="{base_name}.pdf" '
+        f'style="display:block; text-align:center; padding:12px; background:#ff4b4b; color:white; '
+        f'text-decoration:none; border-radius:6px; font-weight:600;">'
+        f'📄 Stáhnout {base_name}.pdf</a>',
+        unsafe_allow_html=True
+    )
+
+    # === KROK 2: Otevřít Perplexity ===
+    st.markdown("#### Krok 2 – Otevřete Perplexity v novém panelu")
+    components.html(
+        '<a href="https://www.perplexity.ai/" target="_blank" rel="noopener noreferrer" '
+        'style="display:block; text-align:center; padding:12px; background:#20b8cd; color:white; '
+        'text-decoration:none; border-radius:6px; font-weight:600; font-family:\'Source Sans Pro\', sans-serif;">'
+        '🔗 Otevřít Perplexity</a>',
+        height=50
+    )
+
+    # === KROK 3: Zkopírovat prompt ===
+    st.markdown("#### Krok 3 – Zkopírujte prompt a vložte ho do Perplexity")
+    prompt_for_perplexity = (
+        f"Vyhodnoť mi tuto diskuzi na téma: \"{topic}\". "
+        f"Její relevantnost a recenzuj verdikt rozhodčího.\n\n"
+        f"Zaměř se na:\n"
+        f"1. Relevantnost diskuze k zadanému tématu.\n"
+        f"2. Kvalitu argumentace obou stran – kde byly přesvědčivé, kde slabé.\n"
+        f"3. Recenzi verdiktu rozhodčího – byl oprávněný? Bylo odůvodnění přesvědčivé?\n"
+        f"4. Silné a slabé stránky obou diskutujících.\n"
+        f"5. Návrh vyváženějšího verdiktu, pokud s ním nesouhlasíš.\n"
+        f"6. Doporučení pro zlepšení příští diskuze.\n\n"
+        f"(Přiložený PDF soubor obsahuje celou diskuzi včetně verdiktu rozhodčího.)"
+    )
+    st.code(prompt_for_perplexity, language=None)
+
+    st.caption("💡 Po najetí myší na blok výše se objeví ikona 📋 pro zkopírování.")
+
+    # === KROK 4: Vložit výsledek ===
+    st.markdown("#### Krok 4 – Vložte sem výsledek kritiky z Perplexity")
+    pasted = st.text_area(
+        "Výsledek z Perplexity:",
+        height=200,
+        key="critique_pasted_perplexity",
+        label_visibility="collapsed",
+        placeholder="Sem vložte text kritiky, který jste zkopírovali z Perplexity..."
+    )
+    if st.button("💾 Uložit kritiku na R2", type="primary", use_container_width=True):
+        if pasted.strip():
+            ok, err, saved_base = save_critique_result(pasted, "Perplexity (manuálně)")
+            if ok:
+                st.success(f"✅ Uloženo jako `VERDICT/markdown/{saved_base}.md` a `VERDICT/pdf/{saved_base}.pdf`.")
+            else:
+                st.warning(f"⚠️ Uložení selhalo: {err}")
+            # ŽÁDNÝ st.rerun() – UI se vykreslí ve stejném běhu
+        else:
+            st.error("Nejprve vložte text kritiky.")
+
+    # === VOLITELNÉ: Automatická cesta ===
+    with st.expander("⚙️ Pokročilé – zkusit automaticky přes PDF URL (může selhat)"):
+        st.caption(
+            "Tato cesta vygeneruje **presigned URL** k PDF souboru na R2 (platnost 1 hodina) "
+            "a pokusí se otevřít Perplexity s promptem obsahujícím tuto URL. "
+            "**Může selhat**, protože Perplexity nemá vždy stabilní extrakci obsahu z URL. "
+            "Pokud selže, použijte manuální cestu výše."
+        )
+        if st.button("🔗 Otevřít Perplexity s PDF URL", key="pplx_auto_btn"):
+            presigned = get_presigned_url(f"pdf/{base_name}.pdf", expires_in=3600)
+            if presigned:
+                short_prompt = (
+                    f"Přečti obsah PDF souboru na této URL a proveď nezávislou kritiku diskuze na téma '{topic}'. "
+                    f"Zhodnoť relevanci, kvalitu argumentace obou stran a kriticky recenzuj verdikt rozhodčího. "
+                    f"Navrhni vyváženější verdikt, pokud s ním nesouhlasíš. "
+                    f"URL (platnost 1 hodina): {presigned}"
+                )
+                pplx_url = f"https://www.perplexity.ai/search?q={urllib.parse.quote(short_prompt)}"
+                components.html(
+                    f'<script>window.open({json.dumps(pplx_url)}, "_blank", "noopener,noreferrer");</script>',
+                    height=0
+                )
+                st.info("📋 Pokud Perplexity obsah nenačte, použijte manuální cestu výše.")
+            else:
+                st.error("Nepodařilo se vygenerovat presigned URL.")
+
 def render_critique_ui(available_providers_list):
     """UI nezávislé kritiky – volá se za render_downloads()."""
     if not st.session_state.md_content:
@@ -400,11 +491,14 @@ def render_critique_ui(available_providers_list):
     st.subheader("🔍 Nezávislá kritika diskuze")
     st.caption("Nechte diskuzi a verdikt rozhodčího posoudit další nezávislou AI.")
 
-    # Tlačítko pro otevření UI
+    # Tlačítko pro otevření UI – BEZ st.rerun()
     if not st.session_state.show_critique_ui and not st.session_state.critique_md:
         if st.button("Spustit nezávislou kritiku", type="primary", use_container_width=True):
             st.session_state.show_critique_ui = True
-            st.rerun()
+            # ŽÁDNÝ st.rerun() – vykreslí se ve stejném běhu
+
+    # UI se zobrazí, pokud je aktivní
+    if not (st.session_state.show_critique_ui or st.session_state.critique_md):
         return
 
     # Výběr kritika
@@ -444,58 +538,12 @@ def render_critique_ui(available_providers_list):
                         st.success(f"✅ Kritika uložena na R2 do `VERDICT/markdown/{base_name}.md` a `VERDICT/pdf/{base_name}.pdf`.")
                     else:
                         st.warning(f"⚠️ Kritika vygenerována, ale uložení na R2 selhalo: {err}")
-                    st.rerun()
+                    # ŽÁDNÝ st.rerun() – UI kritiky se vykreslí níže
                 except Exception as e:
                     st.error(f"Chyba při generování kritiky: {e}")
 
     else:
-        # --- Perplexity flow přes presigned URL ---
-        if st.session_state.file_base_name == "debata":
-            st.error("⚠️ Soubor diskuze nebyl nahrán na R2 (během debaty došlo k chybě uploadu). Použijte prosím API možnost výše.")
-        else:
-            st.markdown("**Automatické otevření Perplexity**")
-            st.caption("Perplexity si sama stáhne `.md` soubor pomocí dočasného (presigned) odkazu z vašeho R2 bucketu. Bucket zůstává soukromý.")
-
-            presigned = get_presigned_url(f"markdown/{st.session_state.file_base_name}.md", expires_in=3600)
-
-            if presigned:
-                topic = st.session_state.current_topic
-                short_prompt = build_short_prompt_for_perplexity(topic, presigned)
-                encoded = urllib.parse.quote(short_prompt)
-                perplexity_url = f"https://www.perplexity.ai/search?q={encoded}"
-
-                st.markdown(
-                    f'<a href="{perplexity_url}" target="_blank" '
-                    f'style="display:block; text-align:center; padding:12px 24px; background:#20b8cd; '
-                    f'color:white; text-decoration:none; border-radius:6px; font-weight:600; font-size:15px;">'
-                    f'🔗 Otevřít Perplexity s promptem a URL</a>',
-                    unsafe_allow_html=True
-                )
-
-                with st.expander("📋 Nebo zkopírujte URL a prompt ručně"):
-                    st.code(f"URL souboru (platnost 1 hodina):\n{presigned}", language=None)
-                    st.code(f"Prompt:\n{short_prompt}", language=None)
-                    st.caption("Vložte URL a prompt přímo do Perplexity chatu, pokud automatické otevření selže.")
-            else:
-                st.error("⚠️ Nepodařilo se vygenerovat presigned URL. Zkontrolujte konfiguraci R2.")
-
-            st.divider()
-            st.markdown("**Vložení výsledku z Perplexity:**")
-            pasted = st.text_area(
-                "Zkopírujte sem výsledek kritiky z Perplexity:",
-                height=180,
-                key="critique_pasted_perplexity"
-            )
-            if st.button("💾 Uložit vloženou kritiku na R2", type="primary", use_container_width=True):
-                if pasted.strip():
-                    ok, err, base_name = save_critique_result(pasted, "Perplexity")
-                    if ok:
-                        st.success(f"✅ Uloženo jako `VERDICT/markdown/{base_name}.md` a `VERDICT/pdf/{base_name}.pdf`.")
-                    else:
-                        st.warning(f"⚠️ Uložení selhalo: {err}")
-                    st.rerun()
-                else:
-                    st.error("Nejprve vložte text kritiky.")
+        render_perplexity_ui()
 
     # Zobrazení hotové kritiky
     if st.session_state.critique_md:
@@ -517,8 +565,7 @@ def render_critique_ui(available_providers_list):
             unsafe_allow_html=True
         )
 
-        # Tlačítko pro otevření nového panelu prohlížeče s kritikou
-        # HTML je base64-encoded, takže se vyhneme problémům s </script> uvnitř stringu.
+        # Tlačítko pro otevření nového panelu s kritikou
         html_full = build_critique_html(st.session_state.critique_md, base_name)
         html_b64 = base64.b64encode(html_full.encode('utf-8')).decode('utf-8')
 
@@ -536,7 +583,7 @@ def render_critique_ui(available_providers_list):
             f'    const html = new TextDecoder("utf-8").decode(bytes);'
             f'    const blob = new Blob([html], {{type: "text/html;charset=utf-8"}});'
             f'    const url = URL.createObjectURL(blob);'
-            f'    const w = window.open(url, "_blank");'
+            f'    const w = window.open(url, "_blank", "noopener,noreferrer");'
             f'    if (!w) alert("⚠️ Panel byl zablokován. Povolte vyskakovací okna pro tuto stránku.");'
             f'  }} catch (e) {{ alert("Chyba: " + e.message); }}'
             f'}}'
@@ -672,11 +719,14 @@ if app_mode == "❓ Nápověda a návody":
         * Plně automatizované – server zavolá API, vygeneruje kritiku a uloží ji na R2 do `VERDICT/markdown/` a `VERDICT/pdf/`.
 
         **Externí varianta (Perplexity):**
-        * Server vygeneruje tzv. **presigned URL** k vašemu `.md` souboru na R2 (platnost 1 hodina).
-        * Otevře se nový panel Perplexity s promptem a URL.
-        * Perplexity si soubor sama stáhne a provede kritiku.
-        * Výsledek zkopírujete zpět do aplikace a uloží se na R2 se stejnou strukturou.
-        * Váš R2 bucket zůstává **soukromý** – presigned URL je dočasná a nepředvídatelná.
+        * Perplexity **nespolehlivě načítá `.md` soubory z URL**. Proto doporučujeme **manuální cestu**:
+          1. Stáhněte si PDF diskuze (tlačítko v UI).
+          2. Otevřete Perplexity v novém panelu.
+          3. Přiložte PDF a vložte připravený prompt.
+          4. Výsledek zkopírujte zpět do aplikace.
+        * V aplikaci je i **pokročilá možnost** s presigned URL (dočasný podepsaný odkaz na PDF v R2), ale ta nemusí fungovat.
+
+        **Výhody presigned URL:** Váš R2 bucket zůstává **soukromý** – presigned URL je dočasná (1 h) a nepředvídatelná.
         """)
 
 elif app_mode == "⚔️ Debatní Aréna":
@@ -938,7 +988,7 @@ elif app_mode == "⚔️ Debatní Aréna":
         st.divider()
         render_downloads()
         
-        # --- NOVÉ: Nezávislá kritika ---
+        # --- Nezávislá kritika ---
         render_critique_ui(available_providers)
         
         st.divider()
@@ -953,7 +1003,7 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.topic_summary = ""
             st.session_state.uploaded_files_hash = ""
             reset_critique_state()
-            st.rerun()
+            st.rerun()  # tady je rerun OK – uživatel čeká kompletní reset
             
         st.stop()
 
@@ -980,7 +1030,7 @@ elif app_mode == "⚔️ Debatní Aréna":
         st.divider()
         render_downloads()
         
-        # --- NOVÉ: Nezávislá kritika ---
+        # --- Nezávislá kritika ---
         render_critique_ui(available_providers)
                 
         st.divider()
@@ -995,4 +1045,4 @@ elif app_mode == "⚔️ Debatní Aréna":
             st.session_state.topic_summary = ""
             st.session_state.uploaded_files_hash = ""
             reset_critique_state()
-            st.rerun()
+            st.rerun()  # tady je rerun OK – uživatel čeká kompletní reset
