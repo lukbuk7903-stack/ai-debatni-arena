@@ -1,7 +1,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
-from google import genai
-from google.genai import errors, types
+from google  genai
+from google.genai  errors, types
 import time, random
 from datetime import datetime
 import pypdf
